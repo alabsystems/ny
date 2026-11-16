@@ -805,16 +805,13 @@ fn peek_property_input_summary(property: Option<&std::path::Path>) -> Option<Pro
 /// #soundness-spine M2a: the old `competition_mode: bool` is replaced by the
 /// frozen [`ResolvedProofProfile`] the ENTRY POINT resolved (`ny vnncomp v1` →
 /// Competition, every other subcommand → Proof, `--proof-profile` overrides).
-/// The profile selects ONLY sinks (whether a certificate sidecar is written)
+/// The profile selects ONLY sinks (whether a certificate sidecar is attempted)
 /// and audit rates; it never reaches certification.
 ///
-/// SOUNDNESS: requesting certificate emission can conservatively withhold a
-/// `Verified` verdict from an optimization whose proof is not representable by
-/// the current external certificate format — but ONLY under an explicit
-/// `--require-certificate`. Without it, both profiles publish every verdict
-/// the lanes certified at runtime and record `artifact=none` when no sidecar
-/// can be written (before M2 the Proof default REFUSED those verdicts, which
-/// made proof mode weaker, not only slower). Nothing here can create or
+/// SOUNDNESS: only `--require-certificate` can conservatively withhold a
+/// `Verified` verdict whose proof the external format cannot represent.
+/// Without it, both profiles publish verdicts certified at runtime and record
+/// `artifact=none` when no sidecar can be written. Nothing here can create or
 /// strengthen a verdict. The float-soundness posture (f64 intermediates,
 /// directed rounding, conservative verdict translation) is baseline and is
 /// NEVER gated by these options.
@@ -827,12 +824,11 @@ pub(crate) struct ProofOpts {
     /// makes certificate authority verdict-bearing; off by default in both
     /// profiles.
     pub require_certificate: bool,
-    /// Explicit certificate-emission override. `None` means "auto" — emit a
-    /// certificate iff the profile writes artifacts (Proof). `Some(true)` /
-    /// `Some(false)` force emission on / off regardless of the profile.
+    /// Request or suppress an optional emission attempt, overriding the profile.
+    /// `None` uses the profile default; `require_certificate` overrides suppression.
     pub emit_certificate: Option<bool>,
-    /// Destination for the certificate sidecar. `None` uses the default path
-    /// (`<model-stem>.cert.json` alongside the model).
+    /// Optional sidecar destination. `None` uses `<model-stem>.cert.json`
+    /// alongside the model.
     pub certificate_path: Option<PathBuf>,
     /// Removed CLI compatibility flag. A `true` value is rejected before model
     /// loading; unsound GPU bounds cannot decide a verdict.
@@ -850,9 +846,8 @@ impl ProofOpts {
         Ok(())
     }
 
-    /// Whether a proof-carrying certificate should be emitted for a `Verified`
-    /// verdict: a required certificate always is; otherwise the explicit
-    /// override, else the profile's sink choice.
+    /// Whether to attempt certificate emission for a `Verified` verdict.
+    /// `require_certificate` takes precedence, then the override, then the profile.
     pub(crate) fn should_emit_certificate(&self) -> bool {
         self.require_certificate
             || self

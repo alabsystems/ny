@@ -90,7 +90,7 @@ impl HeadPhaseAdvice for ActualAy {
         }
         let response: Response = serde_json::from_reader(output.reopen().ok()?).ok()?;
         if response.protocol_version != FUNCTIONAL_PROTOCOL_VERSION
-            || response.ay_revision != "0fb75da29369a25e9c5d6a296f299eec2bb61f35"
+            || response.ay_revision != ny_mip::head_phase_ay::ay_revision()
             || !response.hint.validate(request)
             || Instant::now() >= deadline
         {

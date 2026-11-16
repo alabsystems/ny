@@ -26,7 +26,7 @@ pub const CLEAN_LAKE_PACKAGE: &str = "crownproof";
 /// Canonical internal Clean Git remote. Publication rewrites this dependency.
 pub const CLEAN_GIT_URL: &str = "https://github.com/alabsystems/clean.git";
 /// Audited Clean revision containing every theorem in [`CITED_THEOREMS`].
-pub const CLEAN_GIT_REV: &str = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c";
+pub const CLEAN_GIT_REV: &str = "fae0c94829740c9ffe527eeeb4ea472f9c08001b";
 /// Clean's Lake package root within its repository.
 pub const CLEAN_LAKE_SUBDIR: &str = "crown-proofs/lean";
 /// Lean module directory below the Clean Lake package root.

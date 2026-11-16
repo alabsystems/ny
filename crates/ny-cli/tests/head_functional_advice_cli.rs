@@ -151,10 +151,7 @@ fn actual_functional_ay_helper_slopes_pass_exact_six_dimensional_source_replay()
     let response: WireResponse = serde_json::from_slice(&output.stdout)
         .expect("strict V2 hint envelope without stdout contamination");
     assert_eq!(response.protocol_version, FUNCTIONAL_PROTOCOL_VERSION);
-    assert_eq!(
-        response.ay_revision,
-        "0fb75da29369a25e9c5d6a296f299eec2bb61f35"
-    );
+    assert_eq!(response.ay_revision, ny_mip::head_phase_ay::ay_revision());
     assert!(response.hint.validate(&request));
 
     let mut positive = false;

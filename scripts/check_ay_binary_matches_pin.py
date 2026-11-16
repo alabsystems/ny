@@ -3,56 +3,25 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check that the AyProc `ay` BINARY matches the `ay-milp` Cargo rev pin.
+"""Check the AyProc executable's successful --version against the ay-milp pin.
 
-NY solves AY on two lanes that are supposed to be the same solver:
-
-    ay-milp   the in-process library, rev-pinned in crates/ny-mip/Cargo.toml
-    ay-proc   the frozen P0 subprocess lane, which runs an EXTERNAL `ay`
-              binary found via $NY_AY, else `ay` on $PATH
-
-`scripts/check_git_dep_freshness.py` checks the first against AY's remote HEAD.
-NOTHING checked the second against anything -- so the binary can drift
-arbitrarily far from the pin while every gate stays green.
-
-WHY THIS MATTERS (measured, 2026-07-28). The binary on PATH was 46 days older
-than the pin. Consequences:
-
-  * `tests::backends_agree_on_random_tiny_nets` failed reproducibly (2/2) with
-    "AyProc: tiny net must decide, got Timeout" -- a 3x2 network, at the 300 s
-    default budget. With a binary built from the pin it passes in 2.66 s, and
-    the ny-mip lib suite drops from 2550 s to 5.13 s.
-  * More seriously, `docs/SOLVER_POLICY.md` names the `mip-diff` lib-vs-proc
-    differential as the cross-check that survived the HiGHS deletion. A
-    differential is only evidence when both sides are the SAME solver. Against a
-    stale binary it measures the delta between two AY versions, and a
-    disagreement cannot distinguish "the in-process lane is wrong" from "the
-    subprocess lane is old".
-
-"Frozen" in that policy means NY's P0 subprocess CODE PATH is frozen. It does
-not mean the binary should be pinned in the past.
+Like AyProc, use NY_AY whenever set, otherwise `ay` on PATH. Bare commands use
+PATH. Relative paths with separators use the invoking working directory. An
+empty or unresolvable explicit NY_AY is an error, never a fallback or skip.
+There is no Trust toolchain fallback. Only an unset NY_AY with no `ay` on PATH
+is an optional-lane skip.
 
 Usage:
     python3 scripts/check_ay_binary_matches_pin.py           # report, exit 1 on mismatch
     python3 scripts/check_ay_binary_matches_pin.py --json
     python3 scripts/check_ay_binary_matches_pin.py --warn-only   # always exit 0
 
-A binary that is simply ABSENT (no `$NY_AY`, no `ay` on `$PATH`) is a skip, not
-a failure: the in-process lane is the production default and AyProc is
-debug/bootstrap plus the mip-diff gate. But `$NY_AY` SET AND NOT A FILE is a
-FAILURE, never a skip. It used to fall into the same "absent" bucket and exit 0,
-which is a vacuous pass in exactly the situation this gate exists for: the
-rebuild recipe below puts the pinned binary under `/tmp`, so a stale `$NY_AY`
-survives in a shell rc or a sweep script long after the path is gone, the gate
-reports "AyProc lane unavailable" and passes, and the operator cites a mip-diff
-result on the strength of it.
+Build the reported pinned_rev in a persistent worktree to fix a mismatch:
 
-To fix a mismatch, build the binary from the pinned rev and point $NY_AY at it:
-
-    git -C <ay-repo> worktree add --detach /tmp/ay-pinned <REV>
-    targo --unverified build --release --manifest-path /tmp/ay-pinned/Cargo.toml \\
+    git -C <ay-repo> worktree add --detach "$HOME/ay-pinned" <pinned_rev>
+    targo --unverified build --locked --release --manifest-path "$HOME/ay-pinned/Cargo.toml" \\
         --bin ay --features cli
-    export NY_AY=/tmp/ay-pinned/target/release/ay
+    export NY_AY="$HOME/ay-pinned/target/release/ay"
 """
 
 from __future__ import annotations
@@ -70,27 +39,18 @@ from git_dep_pins import workspace_git_dependency_pins
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# `ay --version` prints e.g.
-#   ay 0.5.0+build.6135.fc32ad715d8e250590a1c1bbc3e74622faff5e4b@2026-07-29T...
+# `ay --version` embeds its full source commit in the build metadata.
 SHA_IN_VERSION = re.compile(r"\b([0-9a-f]{40})\b")
 
 
 def resolve_ay_binary() -> str | None:
-    """Resolve the binary the AyProc lane would run: $NY_AY, else `ay` on PATH.
-
-    Mirrors `ny-mip/src/ay/run.rs::ay_command()` exactly -- two steps, no rustup
-    `trust` toolchain fallback. The gt/cnf routes DO have that third step, but
-    AyProc does not, and a gate that checked a binary the lane would never run
-    would be checking the wrong thing.
-    """
+    """Preflight AyProc's explicit command or default PATH lookup."""
     explicit = os.environ.get("NY_AY")
-    if explicit:
-        return explicit if Path(explicit).is_file() else None
-    return shutil.which("ay")
+    return shutil.which(explicit if explicit is not None else "ay")
 
 
 def binary_sha(binary: str) -> tuple[str | None, str]:
-    """Return (40-hex build sha or None, raw first line of --version)."""
+    """Return (successful 40-hex build sha or None, raw --version first line)."""
     try:
         out = subprocess.run(
             [binary, "--version"],
@@ -103,7 +63,7 @@ def binary_sha(binary: str) -> tuple[str | None, str]:
         return None, f"<failed to run: {exc}>"
     raw = (out.stdout or out.stderr or "").strip().splitlines()
     first = raw[0] if raw else ""
-    found = SHA_IN_VERSION.search(first)
+    found = SHA_IN_VERSION.search(first) if out.returncode == 0 else None
     return (found.group(1) if found else None), first
 
 
@@ -126,19 +86,17 @@ def main() -> int:
     args = ap.parse_args()
 
     pinned = pinned_ay_rev()
-    requested = os.environ.get("NY_AY") or None
+    requested = os.environ.get("NY_AY")
     binary = resolve_ay_binary()
     sha, version = (None, "") if binary is None else binary_sha(binary)
 
     if pinned is None:
         status, detail = "error", "no ay-milp git pin found in the workspace"
     elif binary is None and requested is not None:
-        # $NY_AY was NAMED and does not resolve to a file. Never a skip: the
-        # AyProc lane would fail to launch, and silently exiting 0 here is the
-        # vacuous pass this gate exists to prevent.
         status, detail = (
             "error",
-            f"$NY_AY={requested!r} is not a file; the AyProc lane cannot launch it",
+            f"$NY_AY={requested!r} does not resolve to an executable; "
+            "the AyProc lane cannot launch it",
         )
     elif binary is None:
         # Not fatal on its own: the in-process lane is the production default,
@@ -148,7 +106,10 @@ def main() -> int:
             "$NY_AY unset and no `ay` on $PATH; AyProc lane unavailable",
         )
     elif sha is None:
-        status, detail = "unknown", f"could not parse a build sha from: {version!r}"
+        status, detail = (
+            "unknown",
+            f"--version did not establish a successful build sha: {version!r}",
+        )
     elif sha == pinned:
         status, detail = "ok", "binary matches the ay-milp pin"
     else:

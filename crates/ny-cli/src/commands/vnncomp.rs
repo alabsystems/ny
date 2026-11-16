@@ -2436,31 +2436,11 @@ pub(crate) fn benchmark_configs_dir(configs_dir: &Path, year: u32) -> Option<Pat
     selected.is_dir().then_some(selected)
 }
 
-/// The preset directories a corpus sweep of `year` may consult: newest-first,
-/// but CAPPED at that year.
+/// Return well-formed `vnncompYY` directories newest-first, capped at `year`.
 ///
-/// #sweep-preset-parity. [`benchmark_configs_dir`] exists to stop a NEWER
-/// directory shadowing an OLDER corpus sweep — once `vnncomp26` existed, a
-/// yearless search made a 2025 `safenlp_2024` sweep load the materially
-/// different 2026 preset. That hazard is entirely one-directional, but the
-/// scoping was implemented as "this year and nothing else", which also
-/// forbade falling back to an OLDER directory. The scored path has no such
-/// restriction: `run_instance.sh` passes the unscoped `configs/` root, so
-/// [`resolve_preset_path`] walks `vnncomp26`, then `vnncomp25`, then
-/// `vnncomp24`. Only five families ship a `vnncomp26` yaml, so every
-/// `--year 2026` sweep of the other forty-two ran on AUTO DEFAULTS and did
-/// not measure what ships.
-///
-/// Capping instead of scoping restores parity in the only direction that was
-/// ever wrong: for the newest corpus the search order is identical to the
-/// scored path's, and for an older corpus every newer directory is still
-/// excluded. Copying yamls forward would "fix" it by duplicating 42 presets
-/// into the shadowing directory and turning the originals into placebos,
-/// which is the opposite of parity.
-///
-/// Only well-formed `vnncompYY` names participate: a two-digit year is what
-/// makes "at or before the requested year" a decidable question, and a
-/// sweep that cannot order a directory must not silently prefer it.
+/// #sweep-preset-parity: retain fallback to older presets while excluding
+/// newer-year presets. For the newest corpus this matches the scored
+/// [`resolve_preset_path`] search.
 pub(crate) fn benchmark_preset_search_dirs(configs_dir: &Path, year: u32) -> Vec<PathBuf> {
     let expected = format!("vnncomp{:02}", year % 100);
     vnncomp_dirs_newest_first(configs_dir)

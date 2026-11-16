@@ -56,7 +56,7 @@ list induction) typecheck with the standard axiom base only.
 
 Clean's `Crownproof` library supplies the shared soundness and certificate
 checker modules at exact commit
-`e7ae5d418cbac2e1a029369a5b5eda690d471c5c`. NY does not copy those sources.
+`fae0c94829740c9ffe527eeeb4ea472f9c08001b`. NY does not copy those sources.
 The 70 NY-origin modules live under `lean/NyProof/` and import the Clean base as
 `Crownproof.*`. See `lean/PROVENANCE.md` for the retained/removed
 classification and authorship record.

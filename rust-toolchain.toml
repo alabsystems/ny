@@ -1,4 +1,4 @@
 # Locally linked Trust toolchain. Choose the verified or unverified lane in
-# each targo command; this pin selects only the compiler.
+# each targo command; this selects the host's local compiler alias.
 [toolchain]
 channel = "trust"

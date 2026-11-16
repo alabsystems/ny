@@ -28,8 +28,8 @@ pub(super) enum AyRun {
     TimedOut,
 }
 
-/// Resolve the ay executable: `$NY_AY` if set, else `ay` on `$PATH` (the
-/// same discovery convention as ny's gt/cnf ay routes).
+/// Use `$NY_AY` whenever set (including empty), otherwise `ay` on `$PATH`.
+/// AyProc has no Trust toolchain fallback.
 fn ay_command() -> Command {
     match std::env::var_os("NY_AY") {
         Some(path) => Command::new(path),

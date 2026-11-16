@@ -19,6 +19,9 @@ refuse a debug build as VOID, and the `proof_check_real` integration target
 drives the release `ny` binary on banked rows (it also needs python3 with
 onnxruntime and is meant to run under `scripts/ny_box.sh measure`). The lane
 also carries `f64_tail_census` and the dist_shift real-model admission probe.
+The prepared-source byte/path equivalence test requires the original
+`benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx`;
+it checks the model's pinned SHA-256 before comparing both extraction paths.
 
 Download the VNN-COMP benchmark repositories first
 (`benchmarks/download_benchmarks.sh`). The cGAN tests use

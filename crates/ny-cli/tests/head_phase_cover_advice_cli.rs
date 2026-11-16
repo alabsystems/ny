@@ -120,10 +120,7 @@ fn actual_phase_cover_hidden_ay_returns_only_replayable_pinned_multipliers() {
     assert!(output.stdout.len() <= PHASE_COVER_MAX_RESPONSE_BYTES);
     let response: Response = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response.protocol_version, PHASE_COVER_PROTOCOL_VERSION);
-    assert_eq!(
-        response.ay_revision,
-        "0fb75da29369a25e9c5d6a296f299eec2bb61f35"
-    );
+    assert_eq!(response.ay_revision, ny_mip::head_phase_ay::ay_revision());
     assert!(response.hint.validate(&request));
     assert_eq!(response.hint.leaves.len(), 2);
     let hint = response.hint.leaves.iter().find(|h| h.mask == 1).unwrap();

@@ -1767,12 +1767,10 @@ fn run() -> Result<()> {
             // SOUND: PGD only finds re-validated counterexamples, so toggling it
             // never changes a verified/unsat verdict.
             let pgd_attack = pgd_attack && !no_pgd_attack;
-            // Resolve the proof/certificate policy. `--emit-certificate <path>`
-            // forces emission ON (and sets the path); `--no-certificate` forces
-            // it OFF; otherwise it is auto = NOT competition mode (ON by
-            // default for interactive runs). A certificate request is threaded
-            // into the verifier so verdict-only proof lanes without an external
-            // transcript fail closed instead of producing an unexportable proof.
+            // Flags request or suppress an optional certificate attempt;
+            // otherwise the proof profile supplies the default. Independently,
+            // `--require-certificate` restricts verdicts to representable proofs
+            // and overrides suppression through ProofOpts.
             let emit_certificate_override = if emit_certificate.is_some() {
                 Some(true)
             } else if no_certificate {

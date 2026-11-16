@@ -136,10 +136,7 @@ fn actual_ay_helper_duals_pass_exact_shifted_source_phase_replay() {
     let response: WireResponse = serde_json::from_slice(&output.stdout)
         .expect("stdout must contain only the strict bounded hint envelope");
     assert_eq!(response.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(
-        response.ay_revision,
-        "0fb75da29369a25e9c5d6a296f299eec2bb61f35"
-    );
+    assert_eq!(response.ay_revision, ny_mip::head_phase_ay::ay_revision());
     assert!(response.hint.validate(&request));
 
     // Binary64 values become exact rationals. Both sign conventions offer

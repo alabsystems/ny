@@ -2,21 +2,9 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# vggnet16_2022 VNN-COMP 2025 benchmark config
-#
-# Benchmark characteristics:
-# - Large VGG16 ImageNet robustness benchmark (1000 outputs)
-# - 18 instances, 1200s timeout each
-# - Reference alpha-beta-CROWN config:
-#   complete_verifier/exp_configs/vnncomp22/vggnet16.yaml
-# - ny keeps the currently wired subset of that preset here:
-#   * preserve input-split branching intent
-#   * route CROWN backward through `device: wgpu`
-# - The reference also uses `loss_reduction_func: max`, but ny does not
-#   apply that preset knob yet, so it is intentionally omitted here.
-# - The local benchmark archive exposes `onnx/vgg16-7.onnx` via a symlink into
-#   `vggnet16_2023`, so this preset keeps the category runnable for future
-#   current-head probes.
+# VGG16 ImageNet robustness: 18 instances, 1200 seconds each.
+# Historical results: reports/measured-2026/vggnet16_2022.csv.
+# Input-split/MaxPool-rewrite experiment: vggnet16_2022_abcrown_parity_canary.yaml.
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/vggnet16_2022
@@ -25,58 +13,8 @@ general:
 
 bab:
   batch_size: 1
-  # Phase budget overrides (#4208).
-  # Evidence: stock wgpu 30s smoke overran deadline — all budget consumed
-  # by alpha-CROWN warmup on 1000-output VGG16 before BaB starts.
-  # Cap warmup at 15% of total, matching cifar100/soundnessbench presets.
+  # Keep time for branch-and-bound and the final PGD stage.
   phase_budget:
     initial_bounds_fraction: 0.15
-    # Same dispatch-bound-PGD profile as tinyimagenet/cifar100: the disjunctive PGD
-    # sampling attack defaults to 50% of the budget, which on a 150528-elem VGG16 with
-    # ~200ms+ GPU-dispatch-bound forward passes starves BaB. Cut it to 10% — sound
-    # (never a wrong verdict), frees wall-clock for BaB; post-BaB PGD still runs.
     disjunctive_pgd_fraction: 0.10
-    # Reserve 10% for post-BaB PGD fallback (#2206).
     post_bab_pgd_fraction: 0.10
-  # branching.method removed: auto-branching picks ReLU-split for this very-high-dim
-  # (150528-elem) conv net.
-  #
-  # THE "input-splitting that box is hopeless" JUSTIFICATION THIS COMMENT USED TO
-  # CARRY IS FALSE AS STATED (measured 2026-08-09, lane4 A3 parity). The box being
-  # split is the PERTURBED box, not the model input. Counted directly off the
-  # shipped VNN-LIB files (upper > lower per X_i):
-  #     spec0/1/2               ->      1 perturbed input
-  #     spec3/4/5               ->      5
-  #     spec6/7/8               ->     10
-  #     spec9/10/11             ->     20
-  #     spec12/13/14            ->    100
-  #     spec15/16/17            -> 150528
-  # So 15 of 18 rows perturb between 1 and 100 scalars. `auto_select_branching`
-  # (commands/beta_crown/branching.rs) keys ONLY on `input_element_count` = 150528
-  # and never on the perturbed count, even though `peek_property_input_summary`
-  # already computes `perturbed_count` for the VGG treatment gate. Every row here
-  # therefore takes rule 4 (HighDimOrManyRelu -> kFSB) on a box that is usually
-  # 1-100 dimensional. That is a real routing gap, NOT a justified choice.
-  #
-  # KEEPING kFSB ANYWAY IS STILL THE MEASURED CALL TODAY. The A3 parity arm
-  # (configs/vnncomp25/vggnet16_2022_abcrown_parity_canary.yaml: SB input split +
-  # exact 2x2 MaxPool rewrite + forward+backward, i.e. alpha-beta-CROWN's own VGG
-  # recipe) was A/B'd against this preset at the official 1200 s budget, arms
-  # interleaved, same binary (mip,cuda), GB10, contended box (loadavg 36-83):
-  #     spec12 (banked unsat)  control unsat 483.8s   parity unsat   505.0s  HELD
-  #     spec13 (banked unsat)  control unsat 582.6s   parity unknown 1207.3s LOST
-  #     spec13 repeat          control unsat 470.6s   parity unknown 1208.2s LOST
-  #     spec14 (open target)   control tmo  1207.0s   parity tmo     1212.7s no convert
-  # spec13 is 2/2 in each direction across loadavg 36-83, so the loss is real and
-  # not a contention artefact.
-  # Net on the sample: 0 gained, 1 lost. The mechanism is in the run log, not the
-  # branching choice: the input-split entry path runs "Computing forward-linear
-  # initial bounds for DomainList BaB input split" over the whole 138M-parameter
-  # graph and then prints "Skipping ... because the warmup deadline expired" —
-  # 287 s burned on spec13 and 470 s on spec14, before any domain is expanded.
-  # Fix that warmup (or make it perturbed-subspace-scoped) before re-testing SB
-  # input splitting here; the recipe is right, the entry cost is what kills it.
-  #
-  # spec14 is the only realistic remaining conversion (alpha-beta-CROWN 41.3 s,
-  # nnenum 893.8 s, GT unsat via (h), no counterexample risk). spec15/16/17 need
-  # 974-1165 s from the winner on 150528 perturbed inputs and are out of reach.

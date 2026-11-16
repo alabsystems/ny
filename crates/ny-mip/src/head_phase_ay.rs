@@ -44,6 +44,12 @@ pub const PHASE_COVER_HELPER_COMMAND: &str = "__head-phase-cover-ay-advice";
 // Managed by scripts/bump_ay_pin.py with the dependency manifests and lock.
 // This tags untrusted advice; NY's original-source replay grants authority.
 const AY_REVISION: &str = "1c059f7b7acf55cddb3e2d09d7cff1167117e186";
+
+/// Immutable AY dependency revision managed with the manifests and lockfile.
+pub const fn ay_revision() -> &'static str {
+    AY_REVISION
+}
+
 const LOCAL_SLICE: Duration = Duration::from_millis(250);
 const PHASE_COVER_LOCAL_SLICE: Duration = Duration::from_millis(750);
 const POLL_SLICE: Duration = Duration::from_millis(1);

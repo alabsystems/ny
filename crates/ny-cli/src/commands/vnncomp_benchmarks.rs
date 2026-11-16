@@ -326,23 +326,30 @@ pub(crate) enum BenchmarkAssetsAction {
         /// How sat claims are scored: adjudicated (default), assumed-valid, or
         /// unvalidated
         ///
-        /// `adjudicated` uses the organizers' published adjudication where it
-        /// exists, and otherwise needs two independent sat claims before a
-        /// counterexample can convict an unsat; a lone contested sat scores
-        /// nobody. `assumed-valid` treats every sat as valid. `unvalidated`
-        /// credits every claimed verdict, which reproduces the published 2025
-        /// totals but rewards unsound tools.
+        /// For 2026, `adjudicated` uses published per-run counterexample checks
+        /// and source-bound --ny-ce-checks. Tolerant acceptance credits its own
+        /// SAT; only strict acceptance convicts UNSAT. Missing checks are
+        /// unqualified. `assumed-valid` and `unvalidated` are raw projections.
         #[arg(long, value_enum, default_value = "adjudicated")]
         witnesses: super::vnncomp_score::Witnesses,
 
-        /// Organizer adjudication: a released results corpus, or the
+        /// Historical organizer truth summary: a released results corpus, or the
         /// `SCORING/results.txt` inside it
         ///
-        /// Found automatically when --official points at an unsanitized
+        /// Used by the 2025 model. Found automatically when --official points at an unsanitized
         /// corpus. A sanitized copy usually lacks `SCORING/`; pass the raw
         /// corpus here instead.
         #[arg(long)]
         ground_truth: Option<PathBuf>,
+
+        /// Source-bound NY replay checks; raw SAT claims receive no 2026
+        /// adjudicated credit without them
+        #[arg(long, requires = "ny_ce_source")]
+        ny_ce_checks: Option<PathBuf>,
+
+        /// Exact NY source commit required by every supplied replay check
+        #[arg(long, requires = "ny_ce_checks")]
+        ny_ce_source: Option<String>,
 
         /// Check solved rows against this year's official per-instance timeouts
         /// (repeatable); rows over budget are reported and not scored
@@ -766,6 +773,8 @@ pub(crate) fn handle_benchmark_assets_command(action: BenchmarkAssetsAction) -> 
             budget_years,
             witnesses,
             ground_truth,
+            ny_ce_checks,
+            ny_ce_source,
         } => {
             let opts = super::vnncomp_score::ScoreOptions {
                 results,
@@ -778,6 +787,8 @@ pub(crate) fn handle_benchmark_assets_command(action: BenchmarkAssetsAction) -> 
                 budget_years,
                 witnesses,
                 ground_truth,
+                ny_ce_checks,
+                ny_ce_source,
             };
             super::vnncomp_score::run_score(&opts).map(|_| ())
         }

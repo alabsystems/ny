@@ -46,7 +46,8 @@ fn run(start: Instant) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     writeln!(
         output,
-        "c backend ny-mip/ay-milp 0fb75da29369a25e9c5d6a296f299eec2bb61f35; no subprocess"
+        "c backend ny-mip/ay-milp {}; no subprocess",
+        ny_mip::head_phase_ay::ay_revision()
     )?;
     match result {
         Ok(Outcome::Incumbent(candidate)) => {

@@ -2,34 +2,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Guard: every workspace crate that pins the AY git repository must pin the SAME
-//! revision.
+//! Every AY dependency must share one immutable revision. A split pin can
+//! resolve successfully, but the submission receipt refuses ambiguous AY
+//! provenance. A stale lockfile separately fails the locked build.
 //!
-//! This is a submission-integrity check, not a style preference. Two revisions of
-//! one Git repo make Cargo resolve two copies of every `ay-*` crate, which breaks
-//! the scored path at two independent gates:
-//!
-//!   1. `vnncomp_scripts/build_submission_binary.sh` builds with `--locked`, and a
-//!      lockfile carrying both revisions no longer matches the manifests:
-//!      error: cannot update the lock file ... because --locked was passed
-//!      The required `mip,cuda` tier fails and the builder exits WITHOUT a binary.
-//!   2. `vnncomp_scripts/submission_binary_receipt.sh` `receipt_ay_commit()` fails
-//!      closed on multiple pins, so no provenance receipt is written.
-//!
-//! With no `target/release/ny`, `run_instance.sh` writes `error` for EVERY instance
-//! and the official scorer gives 0 to anything that is not holds/violated. So a
-//! split pin zeroes the entire submission, not one benchmark.
-//!
-//! It is invisible in normal development because a plain `cargo build` (no
-//! `--locked`) resolves both revisions side by side and succeeds. Only the sealed
-//! builder rejects it — which is why this cheap test exists at the `cargo test`
-//! layer, where it is seen immediately.
-//!
-//! This has happened twice, both times because ny-mip was bumped alone while
-//! ny-cli kept its old pin, and both were caught only by running the sealed
-//! builder by hand.
-//!
-//! When bumping AY, bump EVERY pin below together and regenerate `Cargo.lock`.
+//! Use `scripts/bump_ay_pin.py` to update both manifests, the lockfile and
+//! active identity claims together.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -85,10 +63,8 @@ fn every_ay_pin_in_the_workspace_names_the_same_revision() {
         distinct.len(),
         1,
         "AY pins disagree across the workspace: {by_manifest:#?}\n\
-         Two revisions of one Git repo make Cargo resolve two copies of every ay-* crate. \
-         The sealed builder (--locked) then fails, no binary and no receipt are produced, \
-         run_instance.sh writes `error` for every instance, and the WHOLE SUBMISSION scores 0. \
-         Bump every pin together and regenerate Cargo.lock."
+         The submission receipt requires one AY revision. \
+         Use scripts/bump_ay_pin.py to update all identity surfaces together."
     );
 }
 

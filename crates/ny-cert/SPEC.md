@@ -20,7 +20,7 @@ Lean-proven, sorry-free (checked by `cite_check`), and resting only on
 ReLU / depth-k / softmax / LayerNorm / β-CROWN are instantiations.
 
 Clean is a pinned Lake dependency, not vendored source. `proofs/lean/lakefile.toml`
-uses private Clean commit `e7ae5d418cbac2e1a029369a5b5eda690d471c5c` with
+uses private Clean commit `fae0c94829740c9ffe527eeeb4ea472f9c08001b` with
 `subDir = "crown-proofs/lean"`; the dependency supplies `Crownproof`, including
 the shared soundness-method proofs (Bridge, Deep, DeepK, Sbar, Gelu, LayerNorm,
 McCormick, Rsqrt, Hull/ConvHull, Complete*, cert checkers, BaB/branch). NY-origin

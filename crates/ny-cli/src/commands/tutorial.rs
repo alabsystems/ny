@@ -149,7 +149,8 @@ fn basics() {
         -p tests/models/crossing_relu_unsafe.vnnlib    # → VIOLATED, exit 1
 
   Exit codes: 0 proved, 1 falsified, 2 unknown, 3 timeout, 4 operational error.
-  `verify --allow-unknown` explicitly maps only unknown to 0; timeout stays 3."
+  `verify --allow-unknown` maps ordinary unknown to 0; refused witnesses stay 2,
+  timeouts 3."
     );
 
     heading("Basics · 5/5 — ny does not ask you to trust it");
@@ -190,7 +191,7 @@ fn robustness() {
   3 timeout, 4 invalid invocation or operational error), or use the Python
   pytest plugin:
 
-      # Explicitly accept an unresolved completed result; timeout still exits 3.
+      # Accept ordinary unknown results; refused witnesses and timeouts still fail.
       ny verify model.onnx -p prop.vnnlib --allow-unknown
 
       from ny_pytest import assert_verified

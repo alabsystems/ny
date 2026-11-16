@@ -1,6 +1,6 @@
 # ny-cert proof-carrying soundness trust-base audit
 # Reproduce: lake exe cache get && lake build NyProof.AxiomAudit && lake env lean NyProof/AxiomAudit.lean
-# Clean dependency: e7ae5d418cbac2e1a029369a5b5eda690d471c5c (crown-proofs/lean)
+# Clean dependency: fae0c94829740c9ffe527eeeb4ea472f9c08001b (crown-proofs/lean)
 # Full certified sat_relu sweep: lake build NyProof.SatReluSweepAll
 # Toolchain: Lean (version 4.30.0, arm64-apple-darwin24.6.0, commit d024af099ca4bf2c86f649261ebf59565dc8c622, Release)
 # Generated against Mathlib v4.30.0. Expected: every theorem depends on AT MOST

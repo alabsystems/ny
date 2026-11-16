@@ -22,7 +22,8 @@ rustup run trust targo --unverified build --locked --release -p ny-cli --feature
 Install Trust through [aterm](https://github.com/alabsystems/aterm#install)
 with `aterm pkg install trust`, then run `aterm help rust` in the checkout.
 The `trust` toolchain is a local rustup link; its compiler version depends on
-the host.
+the host. If `targo` rejects the pinned AY manifests with `unknown field
+backstop`, update the managed Trust installation.
 
 The competition builder, `scripts/vnncomp_trust_linux_build.sh`, requires
 Ubuntu 24.04 x86_64 and enables `--features mip,cuda`.
@@ -31,11 +32,9 @@ requires Ubuntu 24.04 or newer. On older systems, use a 24.04 container or set
 `ORT_LIB_LOCATION` to a locally built runtime. `install_tool.sh` can fall back
 to a source build, which still requires Trust.
 
-**Do not drop `--features mip` when building anything you intend to measure.**
-Without it, `try_sign_space_falsify` and `try_ste_pgd_falsify` compile to stubs
-that return `None`, so both BNN falsification lanes silently vanish and later
-lanes run in their place. Guard a measurement by asserting `mip_compiled=true`
-in the `bnn_falsification_policy` event of a smoke run's flight sidecar
+**Build measured binaries with `--features mip`.** Without it, both BNN
+falsification lanes are disabled. Confirm `mip_compiled=true` in the
+`bnn_falsification_policy` event of a smoke run's flight sidecar
 (`<results>.flight.json`).
 
 ## Test

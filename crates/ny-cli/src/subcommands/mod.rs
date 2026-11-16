@@ -179,7 +179,7 @@ pub(crate) struct VerifyArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) allow_heuristic_softmax: bool,
 
-    /// Exit 0 on an unknown result instead of 2 (a timeout still exits 3)
+    /// Exit 0 on ordinary unknown results; refused witnesses stay 2, timeouts 3
     #[arg(long, default_value_t = false)]
     pub(crate) allow_unknown: bool,
 
@@ -685,11 +685,11 @@ pub(crate) struct BetaCrownArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) require_certificate: bool,
 
-    /// Force-disable certificate emission even outside competition mode.
+    /// Disable optional certificate emission (--require-certificate takes precedence).
     #[arg(long, default_value_t = false, conflicts_with = "emit_certificate")]
     pub(crate) no_certificate: bool,
 
-    /// Write the proof certificate to this path, whatever the proof profile
+    /// Attempt proof certificate emission at this path, regardless of profile
     /// (default path: `<model-stem>.cert.json`)
     #[arg(long)]
     pub(crate) emit_certificate: Option<PathBuf>,

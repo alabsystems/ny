@@ -431,6 +431,7 @@ fn prepared_original_source_refuses_batch_axis_flatten_axis_training_mode_and_cu
 }
 
 #[test]
+#[cfg(feature = "external-vnncomp")]
 fn prepared_original_source_held_bytes_and_path_extraction_match_actual_cifar100_asset() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
         "../../benchmarks/vnncomp2025/benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx",

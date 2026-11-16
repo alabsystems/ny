@@ -16,11 +16,10 @@
 //! * each benchmark is normalized winner-relative as
 //!   `max(0, 100 * current_raw / best_field_raw)`.
 //!
-//! Plain result CSVs do not retain organizer witness-validation outcomes.
-//! Consistent with `scripts/vnncomp_competitive_score.py`, every SAT row in
-//! this raw-CSV model is therefore assumed to carry a strictly valid witness.
-//! This exposes contradictory UNSAT rows to the real -150 penalty, but it is
-//! still a modeled score rather than an organizer-validated scoreboard.
+//! For 2026, adjudicated scoring reads the published per-run counterexample
+//! checks. Tolerant acceptance credits its own SAT without convicting UNSAT;
+//! only a strict witness does both. Unevidenced SAT claims receive no credit.
+//! Source/build eligibility and cross-version equivalence remain separate gates.
 //!
 //! # Budget enforcement
 //!
@@ -38,6 +37,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -52,10 +52,10 @@ const PENALTY_INCORRECT: i64 = -150;
 const MODELED_SCORE_CAVEAT: &str = "raw CSV: SAT witnesses are assumed valid and are not \
 replayed; normalized identity matching does not reproduce organizer cross-version positional \
 checks";
-const MODELED_2026_SCORE_CAVEAT: &str = "projection only: no released organizer VNN-COMP 2026 \
-team-result corpus or generated score tables are bound; supplied raw CSVs assume SAT witnesses \
-valid and do not reproduce organizer cross-version \
-positional checks";
+const MODELED_2026_SCORE_CAVEAT: &str = "local projection: published per-run counterexample \
+checks are used only in adjudicated mode; unevidenced SAT claims are unqualified. Source/build \
+eligibility, corpus pins, organizer field timeout normalization and cross-version positional \
+checks are not established";
 const UNCHECKED_BUDGET_CAVEAT: &str =
     "recorded runtimes are NOT checked against official per-instance budgets; pass \
 --budget-year to enforce them";
@@ -96,63 +96,14 @@ impl ScoreYear {
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Witnesses {
-    /// Published organiser truth first; failing that, a SAT witness must be
-    /// CORROBORATED before it may convict. This is the default.
-    ///
-    /// Three rules, in order, per instance:
-    ///
-    /// 1. If the released corpus ships the organisers' own adjudication for the
-    ///    instance (`SCORING/results.txt`, a `True Result:` line written after
-    ///    they replayed and validated the counterexample files), that verdict is
-    ///    authoritative: matching it is +10, contradicting it is -150.
-    /// 2. Otherwise a SAT claimed by TWO OR MORE participants is credible and
-    ///    convicts a contradicting UNSAT at -150, exactly as `AssumedValid` does.
-    /// 3. Otherwise, if exactly one participant claims SAT and at least one other
-    ///    claims UNSAT, the instance is DISPUTED. Nobody scores it — not the lone
-    ///    witness, not the tools it contradicts — and the conflict is listed in
-    ///    the report.
-    ///
-    /// Rule 3 exists because under `AssumedValid` a single unreproduced witness
-    /// silently sets a whole category's denominator. Measured on the released
-    /// 2026 corpus: `agate` alone claims SAT on 8 `cgan2026` rows and 5 `nn4sys`
-    /// rows, which is enough to make `agate` the modeled cgan2026 leader at 180
-    /// while alpha-beta-CROWN, pyrat, sobolbox and vibecheck are convicted for
-    /// holding the same rows UNSAT. The organisers scored those 13 witnesses
-    /// `malformed_ce` and charged `agate` -150 on each.
-    ///
-    /// Rule 3 is deliberately symmetric and deliberately NOT a way to recover
-    /// points: it withholds the +10 from the lone SAT and from the UNSAT majority
-    /// alike, so no participant — NY included — can profit from a dispute.
+    /// For 2026, use each published per-run counterexample check and explicit
+    /// source-bound NY replay checks. Only strict acceptance convicts UNSAT;
+    /// tolerant acceptance credits its own SAT. Missing evidence is neutral.
+    /// The historical 2025 model retains published-truth/corroboration rules.
     Adjudicated,
-    /// Every SAT row is assumed to carry a strictly valid counterexample, so an
-    /// UNSAT contradicted by one takes the real -150. Retained because every
-    /// board figure recorded before 2026-08-30 was computed with it, and because
-    /// it is the pessimistic bound on NY's own exposure.
-    ///
-    /// It is NOT conservative in the field-wide sense: it also lets one
-    /// uncorroborated, organiser-rejected witness convict every tool that
-    /// disagrees with it, which moves the winner-relative denominator.
+    /// Projection: assume every raw SAT has a strictly valid witness.
     AssumedValid,
-    /// No counterexample is ever opened, so nothing convicts a contradicting
-    /// UNSAT and every claimed verdict earns +10.
-    ///
-    /// This reproduces the **published** VNN-COMP 2025 board numerically.
-    /// Validated against the organizers' own
-    /// `SCORING-ZERO-TOL/plots_scored/latex/total.tex`: this model returns
-    /// alpha-beta-CROWN 1566.9 and PyRAT 1228.4, matching exactly.
-    ///
-    /// The published run DID validate counterexamples (checked 2026-08-02):
-    /// `settings.py:63` sets `ALWAYS_CHECK_COUNTEREXAMPLES = True`, and
-    /// `SKIP_CE_FILES = True` only relaxes a file-exists `assert` at
-    /// `process_results.py:330`. It checked 5,744 counterexamples across 1,197
-    /// instances and applied 62 live -150 penalties (`results.txt:111602`). The
-    /// numerical agreement above is real; it does not come from skipped
-    /// counterexample checks.
-    ///
-    /// Use it to answer "where would NY have placed", and ONLY that. It rewards
-    /// unsound tools: on cifar100 it makes NNV the winner at 190/200 over
-    /// alpha-beta-CROWN's 129, while NNV holds 19 UNSAT rows that another tool
-    /// contradicts with a SAT witness and every other tool holds none.
+    /// Projection: credit every decided claim without checking witnesses.
     Unvalidated,
 }
 
@@ -160,13 +111,11 @@ impl Witnesses {
     fn label(self) -> &'static str {
         match self {
             Self::Adjudicated => {
-                "published organiser truth first, then corroborated SAT witnesses; \
-                 uncorroborated contested SAT is DISPUTED and scores nobody"
+                "2026 per-run checks (strict and tolerant acceptance differ); \
+                 historical 2025 truth/corroboration model"
             }
             Self::AssumedValid => "SAT witnesses assumed valid (contradicted UNSAT scores -150)",
-            Self::Unvalidated => {
-                "counterexamples not opened by this model (reproduces the published totals)"
-            }
+            Self::Unvalidated => "counterexamples not checked; every decided claim is credited",
         }
     }
 }
@@ -431,6 +380,7 @@ fn normalize_identity_field(raw: &str, anchor: &str, benchmark_aliases: &[&str])
 struct RecordedVerdict {
     verdict: Verdict,
     source: String,
+    source_csv: PathBuf,
     /// Explicit `2025_`/`2026_` category prefix, when the source uses one.
     ///
     /// Most released CSVs use unprefixed ids. Retaining an explicit prefix
@@ -439,11 +389,82 @@ struct RecordedVerdict {
     year_hint: Option<ScoreYear>,
     /// Recorded wall-clock seconds, already validated finite and non-negative.
     seconds: f64,
+    prepare_seconds: Option<f64>,
     /// Run tag from a measured-7 row (`...,run_id`), when present. A row
     /// without one cannot tie its verdict back to a sealed run, which matters
     /// when its runtime is otherwise indistinguishable from a hand-edited
     /// value (see `audit_budgets` on at-budget solves).
     tag: Option<String>,
+    /// Complete six-column row hash after the organizer's verdict substitution.
+    organizer_row_identity: Option<String>,
+    network_field: String,
+    property_field: String,
+    /// Version retained independently of the normalized model/property key.
+    vnnlib_version: Option<String>,
+    counterexample: Option<CounterexampleCheck>,
+}
+
+/// Published `cex_checks.py` outcomes: own credit and strict SAT authority differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterexampleCheck {
+    Strict,
+    Tolerant,
+    Missing,
+    Malformed,
+    Invalid,
+    Unsupported,
+}
+
+impl CounterexampleCheck {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "correct" => Ok(Self::Strict),
+            "correct_up_to_tolerance" => Ok(Self::Tolerant),
+            "no_ce" => Ok(Self::Missing),
+            "malformed_ce" => Ok(Self::Malformed),
+            "exec_doesnt_match" | "spec_not_violated" | "wrong_shape" => Ok(Self::Invalid),
+            "unsupported" => Ok(Self::Unsupported),
+            _ => bail!("unrecognized organizer counterexample outcome {value:?}"),
+        }
+    }
+
+    fn metadata(self) -> (&'static str, bool, bool) {
+        match self {
+            Self::Strict => ("correct", true, true),
+            Self::Tolerant => ("correct_with_tolerance", false, true),
+            Self::Missing => ("missing", false, false),
+            Self::Malformed => ("malformed", false, false),
+            Self::Invalid => ("incorrect", false, false),
+            Self::Unsupported => ("unsupported", false, false),
+        }
+    }
+}
+
+fn organizer_row_identity(fields: &[String]) -> Result<String> {
+    let mut row = fields.to_vec();
+    row[4] = "violated".into();
+    // Python's json.dumps(..., separators=(',', ':')) defaults to ensure_ascii.
+    let json = serde_json::to_string(&row)?;
+    let mut canonical = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if ch.is_ascii() {
+            canonical.push(ch);
+        } else {
+            use std::fmt::Write;
+            let mut units = [0; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                write!(&mut canonical, "\\u{unit:04x}")?;
+            }
+        }
+    }
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+fn row_vnnlib_version(property: &str) -> Option<String> {
+    let parts = property.split('/').collect::<Vec<_>>();
+    parts.windows(2).find_map(|pair| {
+        (pair[1] == "vnnlib" && matches!(pair[0], "1.0" | "2.0")).then(|| pair[0].to_owned())
+    })
 }
 
 type ResultRows = BTreeMap<InstanceKey, RecordedVerdict>;
@@ -635,6 +656,8 @@ fn read_results(path: &Path) -> Result<ResultRows> {
             continue;
         }
         let schema = CsvSchema::for_fields(&fields, path, line_number)?;
+        let verdict = Verdict::parse(&fields[schema.verdict_index()])
+            .with_context(|| format!("{}:{line_number}", path.display()))?;
         let (year_hint, _) = ScoreYear::from_category_prefix(fields[0].trim());
         let mut key = InstanceKey::new(&fields[0], &fields[1], &fields[2])
             .with_context(|| format!("{}:{line_number}", path.display()))?;
@@ -658,12 +681,22 @@ fn read_results(path: &Path) -> Result<ResultRows> {
             &mut out,
             key,
             RecordedVerdict {
-                verdict: Verdict::parse(&fields[schema.verdict_index()])
-                    .with_context(|| format!("{}:{line_number}", path.display()))?,
+                verdict,
                 source,
+                source_csv: path.to_path_buf(),
                 year_hint,
                 seconds,
+                prepare_seconds: (schema == CsvSchema::Official6)
+                    .then(|| fields[3].parse::<f64>())
+                    .transpose()?,
                 tag,
+                organizer_row_identity: (schema == CsvSchema::Official6 && verdict == Verdict::Sat)
+                    .then(|| organizer_row_identity(&fields))
+                    .transpose()?,
+                network_field: fields[1].clone(),
+                property_field: fields[2].clone(),
+                vnnlib_version: row_vnnlib_version(&fields[2]),
+                counterexample: None,
             },
         )?;
     }
@@ -908,26 +941,490 @@ fn load_official_field(root: &Path) -> Result<OfficialField> {
     Ok(field)
 }
 
+struct CounterexampleRecord {
+    value: serde_json::Value,
+    row_identity: String,
+    category: String,
+    version: String,
+    outcome: CounterexampleCheck,
+}
+
+fn hex_digest(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn read_counterexample_check(path: &Path) -> Result<CounterexampleRecord> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .with_context(|| format!("read counterexample check {}", path.display()))?,
+    )?;
+    let string = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("{}: missing string {pointer}", path.display()))
+    };
+    if value["schema_version"] != 1
+        || string("/checker_version")? != "vnncomp2026-cex-1"
+        || string("/provider")? != "CPUExecutionProvider"
+    {
+        bail!(
+            "{}: unsupported organizer counterexample check",
+            path.display()
+        );
+    }
+    for pointer in [
+        "/dependency_versions/python",
+        "/dependency_versions/onnx",
+        "/dependency_versions/onnxruntime",
+    ] {
+        if string(pointer)?.is_empty() {
+            bail!("{}: empty checker dependency version", path.display());
+        }
+    }
+    let outcome = CounterexampleCheck::parse(string("/result")?)?;
+    let (classification, strict, credit) = outcome.metadata();
+    if string("/classification")? != classification
+        || value["establishes_sat"] != strict
+        || value["score_credit"] != credit
+    {
+        bail!(
+            "{}: counterexample result and derived flags disagree",
+            path.display()
+        );
+    }
+    let row_identity = string("/results_row_identity")?.to_owned();
+    let category = string("/benchmark/category")?.to_owned();
+    let version = string("/benchmark/version")?.to_owned();
+    if !hex_digest(&row_identity, 64) || !matches!(version.as_str(), "1.0" | "2.0") {
+        bail!(
+            "{}: invalid result-row identity or VNN-LIB version",
+            path.display()
+        );
+    }
+    Ok(CounterexampleRecord {
+        value,
+        row_identity,
+        category,
+        version,
+        outcome,
+    })
+}
+
+fn counterexample_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".check.json"))
+        {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "counterexample check is not a regular file: {}",
+                    path.display()
+                );
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn load_published_counterexample_checks(root: &Path, field: &mut OfficialField) -> Result<()> {
+    for (tool, rows) in field {
+        let categories = rows
+            .keys()
+            .map(|key| key.benchmark.clone())
+            .collect::<BTreeSet<_>>();
+        let mut checks = BTreeMap::new();
+        for category in categories {
+            let directory = root.join(tool.as_str()).join(format!("2026_{category}"));
+            if !directory.is_dir() {
+                continue;
+            }
+            for path in counterexample_files(&directory)? {
+                let check = read_counterexample_check(&path)?;
+                if check.category != format!("2026_{category}") {
+                    bail!("{}: check belongs to another category", path.display());
+                }
+                let identity = (check.category, check.version, check.row_identity);
+                if let Some(previous) = checks.insert(identity, check.outcome) {
+                    if previous != check.outcome {
+                        bail!(
+                            "{}: conflicting per-run counterexample checks",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        for (key, entry) in rows {
+            if let (Some(version), Some(identity)) =
+                (&entry.vnnlib_version, &entry.organizer_row_identity)
+            {
+                entry.counterexample = checks
+                    .get(&(
+                        format!("2026_{}", key.benchmark),
+                        version.clone(),
+                        identity.clone(),
+                    ))
+                    .copied();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_replay_pin(value: &serde_json::Value, label: &str) -> Result<PathBuf> {
+    let path = value["path"]
+        .as_str()
+        .with_context(|| format!("{label}: missing path"))?;
+    let expected = value["sha256"]
+        .as_str()
+        .with_context(|| format!("{label}: missing SHA"))?;
+    let bytes = value["bytes"]
+        .as_u64()
+        .with_context(|| format!("{label}: missing size"))?;
+    let (canonical, actual, size) = crate::build_id::sha256_regular_file_nofollow(Path::new(path))?;
+    if !hex_digest(expected, 64)
+        || canonical != Path::new(path)
+        || actual != expected
+        || size != bytes
+    {
+        bail!("{label}: replay artifact path, digest or size differs");
+    }
+    Ok(canonical)
+}
+
+fn pinned_json(value: &serde_json::Value, label: &str) -> Result<serde_json::Value> {
+    let path = checked_replay_pin(value, label)?;
+    let bytes = std::fs::read(path)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != value["sha256"].as_str().unwrap_or("") {
+        bail!("{label}: JSON changed after pin validation");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn same_replay_pin(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    left["path"] == right["path"]
+        && left["sha256"] == right["sha256"]
+        && left.get("bytes").or_else(|| left.get("size_bytes"))
+            == right.get("bytes").or_else(|| right.get("size_bytes"))
+}
+
+fn completed_replay_process(value: &serde_json::Value, budget: Option<f64>) -> bool {
+    value["returncode"] == 0
+        && value["timed_out"] == false
+        && value["interrupted"] == false
+        && value["error"].is_null()
+        && value["wall_seconds"].as_f64().is_some_and(|seconds| {
+            seconds.is_finite()
+                && seconds >= 0.0
+                && budget.is_none_or(|limit| {
+                    seconds <= limit && value["timeout_seconds"].as_f64() == Some(limit)
+                })
+        })
+}
+
+fn validate_ny_counterexample_check(
+    check: &CounterexampleRecord,
+    source: &str,
+    key: &InstanceKey,
+    entry: &RecordedVerdict,
+) -> Result<String> {
+    let evidence = &check.value["ny_evidence"];
+    if evidence["schema"] != "ny_vnncomp2026_row_replay_evidence_v1"
+        || evidence["tool"] != "ny"
+        || evidence["validation_only"] != false
+        || evidence["source_commit"] != source
+        || evidence["occurrence"].as_u64() != Some(key.occurrence as u64)
+        || check.value["benchmark"]["network_field"] != entry.network_field
+        || check.value["benchmark"]["property_field"] != entry.property_field
+        || entry.prepare_seconds != Some(0.0)
+    {
+        bail!("NY check is validation-only or belongs to another source/row");
+    }
+    let csv = checked_replay_pin(&evidence["results_csv"], "results CSV")?;
+    if csv != std::fs::canonicalize(&entry.source_csv)? {
+        bail!("NY replay check belongs to another result CSV");
+    }
+    for name in ["model", "property", "image", "original_result", "witness"] {
+        checked_replay_pin(&evidence[name], name)?;
+    }
+    let replay = pinned_json(&evidence["replay"], "replay")?;
+    let start = pinned_json(&evidence["pilot_start"], "pilot start")?;
+    let observation = pinned_json(&evidence["pilot_observation"], "pilot observation")?;
+    let request = pinned_json(&evidence["replay_request"], "replay request")?;
+    let process = pinned_json(&evidence["replay_process"], "replay process")?;
+    let response = pinned_json(&evidence["replay_stdout"], "replay response")?;
+    let dependencies = pinned_json(&evidence["replay_dependencies"], "replay dependencies")?;
+    let batch = pinned_json(&evidence["batch_result"], "replay batch")?;
+    let plan = pinned_json(&evidence["batch_plan"], "replay batch plan")?;
+    let exec_start = pinned_json(&evidence["exec_start"], "original exec")?;
+    let empty = format!("{:x}", Sha256::digest(b""));
+    let fields = &start["build_identity"]["fields"];
+    let image = &evidence["image"];
+    let run_dir = Path::new(
+        evidence["run_id"]
+            .as_str()
+            .context("missing original run directory")?,
+    );
+    if start["schema"] != "ny_cct_pilot_start_v2"
+        || start["arm"] != "candidate"
+        || start["source"]["head"] != source
+        || fields["commit"] != source
+        || fields["source"] != "clean"
+        || fields["dirty"] != "false"
+        || start["source"]["status_sha256"] != empty
+        || start["source"]["tracked_diff_sha256"] != empty
+        || fields["exe"] != image["sha256"]
+        || fields["features"] != "mip,cuda"
+        || fields["profile"] != "release"
+        || !same_replay_pin(&start["binary"], image)
+        || !same_replay_pin(&start["row"]["model"], &evidence["model"])
+        || !same_replay_pin(&start["row"]["property"], &evidence["property"])
+        || evidence["model"]["path"] != entry.network_field
+        || evidence["property"]["path"] != entry.property_field
+        || start["argv"] != exec_start["argv"]
+        || evidence["pilot_start"]["path"].as_str().map(Path::new)
+            != Some(run_dir.join("start.json").as_path())
+        || evidence["pilot_observation"]["path"]
+            .as_str()
+            .map(Path::new)
+            != Some(run_dir.join("observation.json").as_path())
+        || evidence["original_result"]["path"].as_str().map(Path::new)
+            != Some(run_dir.join("result.txt").as_path())
+    {
+        bail!("NY replay source, image or original inputs differ");
+    }
+    let budget = start["row"]["timeout_seconds"]
+        .as_f64()
+        .context("missing original budget")?;
+    if !budget.is_finite()
+        || budget <= 0.0
+        || observation["status"] != "completed"
+        || observation["protocol_verdict"] != "sat"
+        || observation["drained"] != true
+        || observation
+            .get("outer_timeout_censored")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        || !completed_replay_process(&observation["process"], Some(budget))
+        || observation["process"]["wall_seconds"].as_f64() != Some(entry.seconds)
+        || !completed_replay_process(&process, None)
+        || evidence["original_timeout_seconds"].as_f64() != Some(budget)
+        || evidence["original_wall_seconds"].as_f64() != Some(entry.seconds)
+    {
+        bail!("NY SAT was late, censored, incomplete or has a different runtime");
+    }
+    let expected_prefix = [
+        image["path"]
+            .as_str()
+            .context("missing image path")?
+            .to_owned(),
+        "-v".into(),
+        "vnncomp".into(),
+        "v1".into(),
+        key.benchmark.clone(),
+        entry.network_field.clone(),
+        entry.property_field.clone(),
+        evidence["original_result"]["path"]
+            .as_str()
+            .context("missing original result")?
+            .to_owned(),
+        budget.to_string(),
+    ];
+    let argv = start["argv"]
+        .as_array()
+        .context("missing original solver argv")?;
+    if argv.len() < 11
+        || !argv
+            .iter()
+            .zip(&expected_prefix)
+            .all(|(actual, expected)| actual.as_str() == Some(expected.as_str()))
+    {
+        bail!("NY original solver invocation differs from the scored row/source/budget");
+    }
+    if replay["schema"] != "ny_cct_direct_official_sat_replay_v1"
+        || !same_replay_pin(&replay["pilot_start"], &evidence["pilot_start"])
+        || !same_replay_pin(&replay["pilot_observation"], &evidence["pilot_observation"])
+        || !same_replay_pin(&replay["original_result"], &evidence["original_result"])
+        || replay["response"] != response
+        || replay["dependencies"] != dependencies
+        || response["ok"] != true
+        || response["provider"] != "CPUExecutionProvider"
+        || response["result"] != check.value["result"]
+        || replay["independent_local_strict_sat"] != check.value["establishes_sat"]
+        || replay["official_score_credit"] != false
+        || dependencies["ready"] != true
+        || dependencies["checker_commit"] != "eea564f5d0a8751d8321a409214db14d03f452b8"
+        || request["onnx_path"] != evidence["model"]["path"]
+        || request["vnnlib_path"] != evidence["property"]["path"]
+        || request["vnnlib_version"] != check.version
+        || request["witness_path"] != evidence["witness"]["path"]
+        || check.value["witness_sha256"] != evidence["witness"]["sha256"]
+        || check.value["witness_path"] != evidence["witness"]["path"]
+    {
+        bail!("NY checker response is not bound to the original source/witness");
+    }
+    for name in ["python", "onnx", "onnxruntime"] {
+        if response["dependency_versions"][name] != check.value["dependency_versions"][name] {
+            bail!("NY checker dependency version differs: {name}");
+        }
+    }
+    let checker_sources = evidence["checker_sources"]
+        .as_array()
+        .context("missing checker sources")?;
+    if checker_sources.len() != 3 {
+        bail!("incomplete final checker source pins");
+    }
+    let required_names = BTreeSet::from([
+        "cex_checks.py",
+        "counterexamples.py",
+        "counterexamples_v2.py",
+    ]);
+    let mut actual_names = BTreeSet::new();
+    for item in checker_sources {
+        let path = checked_replay_pin(item, "checker source")?;
+        actual_names.insert(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .context("invalid checker source name")?
+                .to_owned(),
+        );
+        if !dependencies["checker_sources"]
+            .as_array()
+            .context("missing replay checker sources")?
+            .iter()
+            .any(|source| same_replay_pin(source, item))
+        {
+            bail!("NY record checker sources differ from the replay");
+        }
+    }
+    if actual_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != required_names
+    {
+        bail!("NY record does not bind the three final checker source files");
+    }
+    let contract = "ny_research_actual_sat_replay_adapter_v2";
+    if source == "f3a24a21a07233f16d92e1e390cb4ce93d6659c2"
+        || batch["schema"] != "ny_cct_actual_sat_replay_batch_result_v2"
+        || batch["all_completed_sat_discovered"] != true
+        || batch["official_score_credit"] != false
+        || evidence["official_score_credit"] != false
+        || plan["adapter_contract"] != contract
+        || batch["collection"]["adapter_contract"] != contract
+        || plan["old_replay_passes_transferred"] != 0
+        || batch["collection"]["old_replay_passes_transferred"] != 0
+        || plan["source_commits"]["candidate"] != source
+        || batch["collection"]["source_commits"]["candidate"] != source
+        || plan["images"]["candidate"]["sha256"] != image["sha256"]
+    {
+        bail!("old/control replay evidence cannot supply fresh NY score credit");
+    }
+    let matching = batch["adjudications"]
+        .as_array()
+        .context("missing actual batch adjudications")?
+        .iter()
+        .filter(|item| {
+            item["arm"] == "candidate"
+                && item["run_dir"] == evidence["run_id"]
+                && item["row"] == start["row"]["index_zero_based"]
+                && same_replay_pin(&item["replay"], &evidence["replay"])
+                && same_replay_pin(&item["result"], &evidence["original_result"])
+                && item["adjudication"] == check.value["result"]
+                && item["strict_correct"] == check.value["establishes_sat"]
+                && item["input_tolerance_only"] == (check.outcome == CounterexampleCheck::Tolerant)
+                && completed_replay_process(&item["command"], None)
+        })
+        .count();
+    if matching != 1 {
+        bail!("NY check does not bind one actual replay-batch adjudication");
+    }
+    let raw = std::fs::read(
+        evidence["original_result"]["path"]
+            .as_str()
+            .context("missing result path")?,
+    )?;
+    let Some(newline) = raw.iter().position(|&byte| byte == b'\n') else {
+        bail!("NY result has no SAT header");
+    };
+    if !raw[..newline].trim_ascii().eq_ignore_ascii_case(b"sat")
+        || std::fs::read(
+            evidence["witness"]["path"]
+                .as_str()
+                .context("missing witness path")?,
+        )? != raw[newline + 1..]
+    {
+        bail!("NY replay changed the original witness assignment");
+    }
+    Ok(image["sha256"]
+        .as_str()
+        .context("missing image SHA")?
+        .to_owned())
+}
+
+fn load_ny_counterexample_checks(
+    directory: &Path,
+    source: &str,
+    current: &mut ResultRows,
+) -> Result<()> {
+    let paths = counterexample_files(directory)?;
+    if paths.is_empty() {
+        bail!("--ny-ce-checks contains no replay checks");
+    }
+    let mut image = None;
+    let mut used = BTreeSet::new();
+    for path in paths {
+        let check = read_counterexample_check(&path)?;
+        let matched = current
+            .iter()
+            .filter(|(key, entry)| {
+                entry.verdict == Verdict::Sat
+                    && check.category == format!("2026_{}", key.benchmark)
+                    && entry.vnnlib_version.as_deref() == Some(check.version.as_str())
+                    && entry.organizer_row_identity.as_deref() == Some(check.row_identity.as_str())
+                    && check.value["ny_evidence"]["occurrence"].as_u64()
+                        == Some(key.occurrence as u64)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let [key] = matched.as_slice() else {
+            bail!(
+                "{}: NY check does not bind exactly one current SAT row",
+                path.display()
+            );
+        };
+        if !used.insert(key.clone()) {
+            bail!("duplicate NY replay check for one result occurrence");
+        }
+        let actual_image = validate_ny_counterexample_check(&check, source, key, &current[key])?;
+        if image
+            .as_ref()
+            .is_some_and(|expected| expected != &actual_image)
+        {
+            bail!("NY replay checks mix executable images");
+        }
+        image = Some(actual_image);
+        current.get_mut(key).expect("matched row").counterexample = Some(check.outcome);
+    }
+    Ok(())
+}
+
 /// Where a released results corpus keeps the organisers' own scoring log.
 const GROUND_TRUTH_RELATIVE_PATH: &str = "SCORING/results.txt";
 
-/// The organisers' published per-instance adjudication.
-///
-/// A released VNN-COMP results corpus ships the scoring run's own log at
-/// `SCORING/results.txt`. For every scored instance it records a `True Result:`
-/// line — the verdict the ORGANISERS settled on after replaying and validating
-/// every submitted counterexample file. That is strictly better evidence than
-/// anything this tool can infer from raw verdict columns, which carry no witness
-/// validation at all, so where it exists it is authoritative and nothing else is
-/// consulted for that instance.
-///
-/// The log identifies a row by `<model-stem>-<property-stem>` with directories
-/// dropped, and that is ambiguous in exactly one released 2026 category:
-/// `safenlp_2024` reuses property filenames across `medical/` and `ruarobot/`,
-/// putting two published rows on each of 26 ids, **16 of which carry two
-/// DIFFERENT `True Result:` verdicts**. Those are DROPPED and reported, never resolved
-/// by taking whichever row was read last — the same basename-join hazard that
-/// once manufactured 123 phantom contradictions in this repository.
+/// Historical stem-based summary used by the 2025 model. Ambiguous names are
+/// dropped and reported. The 2026 model uses full-row per-run checks instead:
+/// a `True Result` summary cannot express tolerant own-tool acceptance.
 #[derive(Debug, Default)]
 pub(crate) struct GroundTruth {
     verdicts: BTreeMap<GroundTruthKey, Verdict>,
@@ -1084,6 +1581,9 @@ pub(crate) struct BenchProgress {
     /// disputed: one participant claims SAT, others hold UNSAT, and no
     /// published organiser truth settles it.
     pub(crate) current_disputed: Option<usize>,
+    pub(crate) unqualified_sat: usize,
+    pub(crate) field_unqualified_sat: usize,
+    pub(crate) field_scores: BTreeMap<String, FieldCategoryScore>,
     /// Every disputed instance in this benchmark, both sides named. Never
     /// summarized away — a withheld row is a claim about the field, not a
     /// rounding detail.
@@ -1125,6 +1625,9 @@ pub(crate) struct ProgressReport {
     pub(crate) total_budget_unchecked: usize,
     /// Sum of winner-relative scores for benchmarks represented in the field.
     pub(crate) normalized_total: Option<f64>,
+    pub(crate) field_normalized_totals: BTreeMap<String, f64>,
+    pub(crate) total_unqualified_sat: usize,
+    pub(crate) total_field_unqualified_sat: usize,
     pub(crate) officially_scored_benchmarks: usize,
     /// Competition edition whose released track split was selected.
     pub(crate) score_year: Option<ScoreYear>,
@@ -1161,6 +1664,8 @@ struct ModeledOfficialScore {
     current_incorrect: usize,
     /// Decided current rows withheld from scoring as disputed.
     current_disputed: usize,
+    current_unqualified_sat: usize,
+    field_scores: BTreeMap<String, FieldCategoryScore>,
     /// One line per disputed instance in this benchmark, both sides named.
     disputes: Vec<String>,
     /// Instances in this benchmark settled by published organiser truth.
@@ -1171,6 +1676,13 @@ struct ModeledOfficialScore {
     current_raw_assumed_valid: i64,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FieldCategoryScore {
+    raw: i64,
+    normalized: f64,
+    unqualified_sat: usize,
+}
+
 /// Label used for the locally measured rows wherever a participant is named.
 const CURRENT_LABEL: &str = "ny (current)";
 
@@ -1178,6 +1690,8 @@ const CURRENT_LABEL: &str = "ny (current)";
 /// participant's claim on that instance rather than row by row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstanceRuling {
+    /// Per-run 2026 checks: only strict SAT convicts other participants.
+    PerRun { strict_sat: bool },
     /// The organisers published a verdict for this instance. Match it for +10,
     /// contradict it for -150; no other evidence is consulted.
     Truth(Verdict),
@@ -1197,6 +1711,7 @@ enum InstanceRuling {
 #[derive(Debug, Default)]
 struct Adjudication {
     rulings: BTreeMap<SemanticKey, InstanceRuling>,
+    per_run: BTreeMap<InstanceKey, bool>,
     /// One line per disputed instance, naming BOTH sides.
     disputes: Vec<String>,
     /// Instances settled by published organiser truth.
@@ -1205,6 +1720,9 @@ struct Adjudication {
 
 impl Adjudication {
     fn ruling(&self, key: &InstanceKey) -> InstanceRuling {
+        if let Some(&strict_sat) = self.per_run.get(key) {
+            return InstanceRuling::PerRun { strict_sat };
+        }
         self.rulings
             .get(&key.semantic_key())
             .copied()
@@ -1294,6 +1812,33 @@ fn adjudicate(
     out
 }
 
+fn adjudicate_per_run(
+    benchmark: &str,
+    current: &ResultRows,
+    field: &OfficialField,
+    scored_instances: &BTreeSet<InstanceKey>,
+    over_budget: &BTreeSet<InstanceKey>,
+) -> Adjudication {
+    let mut out = Adjudication::default();
+    for key in scored_instances
+        .iter()
+        .filter(|key| key.benchmark == benchmark)
+    {
+        let strict_sat = current.get(key).is_some_and(|entry| {
+            !over_budget.contains(key)
+                && entry.verdict == Verdict::Sat
+                && entry.counterexample == Some(CounterexampleCheck::Strict)
+        }) || field.values().any(|rows| {
+            rows.get(key).is_some_and(|entry| {
+                entry.verdict == Verdict::Sat
+                    && entry.counterexample == Some(CounterexampleCheck::Strict)
+            })
+        });
+        out.per_run.insert(key.clone(), strict_sat);
+    }
+    out
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct RowScore {
     raw: i64,
@@ -1301,6 +1846,7 @@ struct RowScore {
     incorrect: usize,
     /// Decided rows withheld from scoring because the instance is disputed.
     disputed: usize,
+    unqualified_sat: usize,
 }
 
 fn score_rows(
@@ -1324,6 +1870,33 @@ fn score_rows(
             continue;
         }
         match adjudication.ruling(key) {
+            InstanceRuling::PerRun { strict_sat } => match entry.verdict {
+                Verdict::Sat => match entry.counterexample {
+                    Some(CounterexampleCheck::Strict | CounterexampleCheck::Tolerant) => {
+                        score.raw += POINTS_CORRECT;
+                        score.correct += 1;
+                    }
+                    Some(
+                        CounterexampleCheck::Missing
+                        | CounterexampleCheck::Malformed
+                        | CounterexampleCheck::Invalid,
+                    ) => {
+                        score.raw += PENALTY_INCORRECT;
+                        score.incorrect += 1;
+                    }
+                    Some(CounterexampleCheck::Unsupported) | None => score.unqualified_sat += 1,
+                },
+                Verdict::Unsat => {
+                    if strict_sat {
+                        score.raw += PENALTY_INCORRECT;
+                        score.incorrect += 1;
+                    } else {
+                        score.raw += POINTS_CORRECT;
+                        score.correct += 1;
+                    }
+                }
+                Verdict::Undecided => {}
+            },
             InstanceRuling::Truth(truth) => {
                 if entry.verdict == truth {
                     score.raw += POINTS_CORRECT;
@@ -1465,23 +2038,43 @@ fn modeled_official_score(
 
     // One ruling per instance, shared by `current` and by every competitor, so
     // the denominator is computed under the SAME model as the numerator.
-    let adjudication = adjudicate(
-        benchmark,
-        current,
-        field,
-        &scored_instances,
-        truth,
-        witnesses,
-    );
+    let adjudication = if year == ScoreYear::Y2026 && witnesses == Witnesses::Adjudicated {
+        adjudicate_per_run(benchmark, current, field, &scored_instances, over_budget)
+    } else {
+        adjudicate(
+            benchmark,
+            current,
+            field,
+            &scored_instances,
+            truth,
+            witnesses,
+        )
+    };
     let current_score = score_rows(current, &scored_instances, &adjudication, over_budget);
-    // The official field's runtimes came from the real harness, which enforces
-    // the timeout itself, so no exclusion applies to the competitors' rows. Only
-    // locally measured results can be over budget.
+    // This projection retains supplied field verdicts. Replaying the organizer's
+    // startup-overhead timeout normalization remains a separate admission gate.
     let no_exclusions = BTreeSet::new();
     let mut field_best_raw = current_score.raw;
-    for rows in field.values() {
-        let raw = score_rows(rows, &scored_instances, &adjudication, &no_exclusions).raw;
-        field_best_raw = field_best_raw.max(raw);
+    let mut field_scores = BTreeMap::new();
+    for (tool, rows) in field {
+        if !rows.keys().any(|key| key.benchmark == benchmark) {
+            continue;
+        }
+        let score = score_rows(rows, &scored_instances, &adjudication, &no_exclusions);
+        field_best_raw = field_best_raw.max(score.raw);
+        field_scores.insert(
+            tool.clone(),
+            FieldCategoryScore {
+                raw: score.raw,
+                unqualified_sat: score.unqualified_sat,
+                ..Default::default()
+            },
+        );
+    }
+    for score in field_scores.values_mut() {
+        if field_best_raw > 0 {
+            score.normalized = (100.0 * score.raw as f64 / field_best_raw as f64).max(0.0);
+        }
     }
     let normalized = if field_best_raw > 0 {
         (100.0 * current_score.raw as f64 / field_best_raw as f64).max(0.0)
@@ -1508,6 +2101,8 @@ fn modeled_official_score(
         current_correct: current_score.correct,
         current_incorrect: current_score.incorrect,
         current_disputed: current_score.disputed,
+        current_unqualified_sat: current_score.unqualified_sat,
+        field_scores,
         disputes: adjudication.disputes,
         truth_resolved: adjudication.truth_resolved,
         field_best_raw,
@@ -1534,6 +2129,8 @@ pub(crate) struct ScoreOptions {
     /// points at an unsanitized corpus this is found automatically; a sanitized
     /// copy that dropped `SCORING/` needs it passed explicitly.
     pub(crate) ground_truth: Option<PathBuf>,
+    pub(crate) ny_ce_checks: Option<PathBuf>,
+    pub(crate) ny_ce_source: Option<String>,
 }
 
 fn validate_year_hints(rows: &ResultRows, selected: ScoreYear, corpus: &str) -> Result<()> {
@@ -1576,11 +2173,31 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
         Some(path) => load(path)?,
         None => BTreeMap::new(),
     };
-    let official = opts
+    let mut official = opts
         .official
         .as_deref()
         .map(load_official_field)
         .transpose()?;
+    if opts.ny_ce_checks.is_some() != opts.ny_ce_source.is_some() {
+        bail!("--ny-ce-checks and --ny-ce-source must be supplied together");
+    }
+    if let Some(source) = &opts.ny_ce_source {
+        if !hex_digest(source, 40)
+            || score_year != Some(ScoreYear::Y2026)
+            || opts.witnesses != Witnesses::Adjudicated
+            || official.is_none()
+        {
+            bail!("NY counterexample checks require --official --year 2026 --witnesses adjudicated and an exact --ny-ce-source commit");
+        }
+    }
+    if score_year == Some(ScoreYear::Y2026) && opts.witnesses == Witnesses::Adjudicated {
+        if let (Some(root), Some(field)) = (&opts.official, &mut official) {
+            load_published_counterexample_checks(root, field)?;
+        }
+        if let (Some(directory), Some(source)) = (&opts.ny_ce_checks, &opts.ny_ce_source) {
+            load_ny_counterexample_checks(directory, source, &mut current)?;
+        }
+    }
     // Published organiser truth, when one is reachable. An explicit path wins;
     // otherwise the released corpus is asked for its own scoring log, which the
     // field loader already skips when collecting result CSVs.
@@ -1728,6 +2345,17 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
             progress.current_correct = Some(score.current_correct);
             progress.current_incorrect = Some(score.current_incorrect);
             progress.current_disputed = Some(score.current_disputed);
+            progress.unqualified_sat = score.current_unqualified_sat;
+            report.total_unqualified_sat += score.current_unqualified_sat;
+            for (tool, value) in &score.field_scores {
+                progress.field_unqualified_sat += value.unqualified_sat;
+                *report
+                    .field_normalized_totals
+                    .entry(tool.clone())
+                    .or_default() += value.normalized;
+            }
+            report.total_field_unqualified_sat += progress.field_unqualified_sat;
+            progress.field_scores = score.field_scores;
             progress.truth_resolved_instances = Some(score.truth_resolved);
             progress.current_raw_score_assumed_valid = Some(score.current_raw_assumed_valid);
             progress.disputed_rows = score.disputes;
@@ -1757,6 +2385,9 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
     }
     if report.officially_scored_benchmarks > 0 {
         report.normalized_total = Some(normalized_total);
+        report
+            .field_normalized_totals
+            .insert(CURRENT_LABEL.into(), normalized_total);
     } else if official.is_some() {
         bail!(
             "official field contains no categories in the selected VNN-COMP {} {} track",
@@ -1852,27 +2483,40 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
                 report.officially_scored_benchmarks,
             );
             println!("witness model: {}", opts.witnesses.label());
-            match &report.ground_truth_source {
-                Some(source) => {
-                    println!(
-                        "ground truth: {} instance(s) from {source}; {} scored against it",
-                        report.ground_truth_instances, report.ground_truth_resolved_instances
-                    );
-                    println!(
-                        "  note: a raw results CSV cannot express two organiser rules (a \
+            if report.score_year == Some(ScoreYear::Y2026)
+                && opts.witnesses == Witnesses::Adjudicated
+            {
+                println!("Per-run checks: strict SAT convicts UNSAT; tolerant SAT earns only its own credit.");
+                println!("Unqualified SAT rows: NY={}, field={}; these receive zero and cannot convict other tools.",
+                    report.total_unqualified_sat, report.total_field_unqualified_sat);
+                let mut totals = report.field_normalized_totals.iter().collect::<Vec<_>>();
+                totals.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                for (tool, score) in totals {
+                    println!("  {tool}: {score:.6}");
+                }
+            } else {
+                match &report.ground_truth_source {
+                    Some(source) => {
+                        println!(
+                            "ground truth: {} instance(s) from {source}; {} scored against it",
+                            report.ground_truth_instances, report.ground_truth_resolved_instances
+                        );
+                        println!(
+                            "  note: a raw results CSV cannot express two organiser rules (a \
                          rejected counterexample is charged -150; a counterexample correct only \
                          up to tolerance still earns +10), so modeled totals can differ \
                          slightly from the published board."
-                    );
-                }
-                None if opts.witnesses == Witnesses::Adjudicated => println!(
+                        );
+                    }
+                    None if opts.witnesses == Witnesses::Adjudicated => println!(
                     "ground truth: NONE SUPPLIED — no organiser adjudication was reachable, so \
                      every instance fell back to corroboration. Pass --ground-truth <corpus> \
                      (the released tree's {}); a sanitized field copy usually drops it. An \
                      absent truth table is a WEAKER model, not a clean one.",
                     GROUND_TRUTH_RELATIVE_PATH
                 ),
-                None => {}
+                    None => {}
+                }
             }
             if !report.ground_truth_ambiguous_keys.is_empty() {
                 println!(
@@ -1884,8 +2528,7 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
             }
             if opts.witnesses == Witnesses::Unvalidated {
                 println!(
-                    "  unvalidated: this reproduces the published totals, which reward \
-                     unsound verdicts; use it only to compare placements."
+                    "  unvalidated projection: every decided claim earns credit without a witness check."
                 );
             }
             println!(
@@ -2112,6 +2755,8 @@ mod tests {
             budget_years: Vec::new(),
             witnesses: Witnesses::AssumedValid,
             ground_truth: None,
+            ny_ce_checks: None,
+            ny_ce_source: None,
         }
     }
 
@@ -2125,6 +2770,315 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    fn publish_check(
+        root: &TempDir,
+        tool: &str,
+        row: &str,
+        outcome: CounterexampleCheck,
+    ) -> PathBuf {
+        let fields = parse_csv_line(row.trim_end_matches(['\r', '\n'])).unwrap();
+        let (classification, strict, credit) = outcome.metadata();
+        let result = match outcome {
+            CounterexampleCheck::Strict => "correct",
+            CounterexampleCheck::Tolerant => "correct_up_to_tolerance",
+            CounterexampleCheck::Missing => "no_ce",
+            CounterexampleCheck::Malformed => "malformed_ce",
+            CounterexampleCheck::Invalid => "spec_not_violated",
+            CounterexampleCheck::Unsupported => "unsupported",
+        };
+        let identity = organizer_row_identity(&fields).unwrap();
+        let value = serde_json::json!({
+            "schema_version": 1, "checker_version": "vnncomp2026-cex-1",
+            "provider": "CPUExecutionProvider",
+            "dependency_versions": {"python": "3.12.13", "onnx": "1.21.0", "onnxruntime": "1.26.0"},
+            "benchmark": {"category": format!("2026_{}", fields[0]), "version": "2.0",
+                          "network_field": fields[1], "property_field": fields[2]},
+            "results_row_identity": identity, "result": result,
+            "classification": classification, "establishes_sat": strict, "score_credit": credit,
+        });
+        write_file(
+            root,
+            &format!(
+                "{tool}/2026_{}/{identity}.counterexample.check.json",
+                fields[0]
+            ),
+            &serde_json::to_string(&value).unwrap(),
+        )
+    }
+
+    #[test]
+    fn organizer_row_hash_matches_pinned_tolerant_acc_run_and_python_unicode_encoding() {
+        let row = vec![
+            "adaptive_cruise_control_non_linear_2026",
+            "vnncomp2026_benchmarks/benchmarks/adaptive_cruise_control_non_linear_2026/2.0/onnx/acc-2000000-64-64-64-64-retrain-100000-200000-0.9.onnx",
+            "vnncomp2026_benchmarks/benchmarks/adaptive_cruise_control_non_linear_2026/2.0/vnnlib/instance_15.vnnlib",
+            "4.453935807", "sat", "7.936269926",
+        ].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            organizer_row_identity(&row).unwrap(),
+            "da9b41c6efa0dc45213f5d0c8edc46964906a7b45d39459eb37aa77dfed6ad6f"
+        );
+        let row = [
+            "cgan2026",
+            "onnx/é😀.onnx",
+            "vnnlib/p.vnnlib",
+            "0",
+            "violated",
+            "1",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            organizer_row_identity(&row).unwrap(),
+            "3ce4327bd135282fdee05cc51b053b4e6b00347c0d2056bb11fd7e474f77dc97"
+        );
+    }
+
+    #[test]
+    fn published_tolerant_sat_earns_own_credit_without_convicting_unsat() {
+        let dir = TempDir::new().unwrap();
+        let official = TempDir::new().unwrap();
+        let sat = "acasxu_2023,corpus/2.0/onnx/m.onnx,corpus/2.0/vnnlib/p.vnnlib,0,sat,1\n";
+        write_file(&official, "tolerant/results.csv", sat);
+        write_file(
+            &official,
+            "holds/results.csv",
+            &sat.replace(",sat,", ",unsat,"),
+        );
+        publish_check(&official, "tolerant", sat, CounterexampleCheck::Tolerant);
+        let current = write_file(&dir, "current.csv", &sat.replace(",sat,", ",unsat,"));
+        let mut options = opts(current, None);
+        options.official = Some(official.path().into());
+        options.year = Some(ScoreYear::Y2026);
+        options.witnesses = Witnesses::Adjudicated;
+        let report = run_score(&options).unwrap();
+        let score = bench(&report, "acasxu_2023");
+        assert_eq!(score.current_raw_score, Some(10));
+        assert_eq!(score.field_scores["tolerant"].raw, 10);
+        assert_eq!(score.field_scores["holds"].raw, 10);
+        assert_eq!(score.field_best_raw_score, Some(10));
+        assert_eq!(score.field_unqualified_sat, 0);
+    }
+
+    #[test]
+    fn strict_ny_check_rescores_incumbent_penalties_and_shared_denominators() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "ny.csv", "acasxu_2023,onnx/m.onnx,vnnlib/p.vnnlib,0,sat,1\nacasxu_2023,onnx/m.onnx,vnnlib/q.vnnlib,0,unsat,1\n");
+        let mut current = load(&path).unwrap();
+        let incumbent_path = write_file(&dir, "incumbent.csv", "acasxu_2023,onnx/m.onnx,vnnlib/p.vnnlib,0,unsat,1\nacasxu_2023,onnx/m.onnx,vnnlib/q.vnnlib,0,unsat,1\n");
+        let field = BTreeMap::from([("incumbent".into(), load(&incumbent_path).unwrap())]);
+        let published = GroundTruth {
+            verdicts: current
+                .keys()
+                .map(|key| (key.ground_truth_key().unwrap(), Verdict::Unsat))
+                .collect(),
+            ..Default::default()
+        };
+        let evaluate = |current: &ResultRows, excluded: &BTreeSet<InstanceKey>| {
+            modeled_official_score(
+                "acasxu_2023",
+                current,
+                &field,
+                ScoreYear::Y2026,
+                ScoreTrack::Regular,
+                excluded,
+                Witnesses::Adjudicated,
+                Some(&published),
+            )
+            .unwrap()
+        };
+        let before = evaluate(&current, &BTreeSet::new());
+        assert_eq!(
+            (
+                before.current_raw,
+                before.current_unqualified_sat,
+                before.field_best_raw
+            ),
+            (10, 1, 20)
+        );
+        assert_eq!(before.normalized, 50.0);
+        let key = current
+            .iter()
+            .find(|(_, entry)| entry.verdict == Verdict::Sat)
+            .unwrap()
+            .0
+            .clone();
+        current.get_mut(&key).unwrap().counterexample = Some(CounterexampleCheck::Strict);
+        let after = evaluate(&current, &BTreeSet::new());
+        assert_eq!(after.field_scores["incumbent"].raw, -140);
+        assert_eq!(
+            (
+                after.current_raw,
+                after.current_unqualified_sat,
+                after.field_best_raw
+            ),
+            (20, 0, 20)
+        );
+        assert_eq!(
+            (after.normalized, after.field_scores["incumbent"].normalized),
+            (100.0, 0.0)
+        );
+        let late = evaluate(&current, &BTreeSet::from([key]));
+        assert_eq!(
+            late.field_scores["incumbent"].raw, 20,
+            "late NY SAT cannot convict another tool"
+        );
+        assert_eq!(late.normalized, 50.0);
+    }
+
+    #[test]
+    fn per_run_unknown_missing_invalid_and_unsupported_are_distinct() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            &dir,
+            "rows.csv",
+            "acasxu_2023,onnx/m.onnx,vnnlib/p.vnnlib,0,sat,1\n",
+        );
+        let mut rows = load(&path).unwrap();
+        let key = rows.keys().next().unwrap().clone();
+        let scored = BTreeSet::from([key.clone()]);
+        let adjudication = Adjudication {
+            per_run: BTreeMap::from([(key.clone(), false)]),
+            ..Default::default()
+        };
+        for (check, points, incorrect, unqualified) in [
+            (None, 0, 0, 1),
+            (Some(CounterexampleCheck::Unsupported), 0, 0, 1),
+            (Some(CounterexampleCheck::Missing), -150, 1, 0),
+            (Some(CounterexampleCheck::Malformed), -150, 1, 0),
+            (Some(CounterexampleCheck::Invalid), -150, 1, 0),
+            (Some(CounterexampleCheck::Tolerant), 10, 0, 0),
+            (Some(CounterexampleCheck::Strict), 10, 0, 0),
+        ] {
+            rows.get_mut(&key).unwrap().counterexample = check;
+            let score = score_rows(&rows, &scored, &adjudication, &BTreeSet::new());
+            assert_eq!(
+                (score.raw, score.incorrect, score.unqualified_sat),
+                (points, incorrect, unqualified)
+            );
+        }
+    }
+
+    #[test]
+    fn per_run_checks_bind_complete_paths_version_runtime_and_derived_flags() {
+        let official = TempDir::new().unwrap();
+        let medical = "safenlp_2024,corpus/2.0/onnx/medical/perturbations_0.onnx,corpus/2.0/vnnlib/medical/hyperrectangle_570.vnnlib,0,sat,1\n";
+        let robot = medical.replace("medical", "ruarobot");
+        write_file(&official, "tool/results.csv", &format!("{medical}{robot}"));
+        let check = publish_check(&official, "tool", medical, CounterexampleCheck::Tolerant);
+        publish_check(&official, "tool", &robot, CounterexampleCheck::Strict);
+        let mut field = load_official_field(official.path()).unwrap();
+        load_published_counterexample_checks(official.path(), &mut field).unwrap();
+        let statuses = field["tool"]
+            .values()
+            .map(|row| row.counterexample)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                Some(CounterexampleCheck::Tolerant),
+                Some(CounterexampleCheck::Strict)
+            ]
+        );
+        let mut changed =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&check).unwrap()).unwrap();
+        changed["establishes_sat"] = true.into();
+        std::fs::write(&check, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(load_published_counterexample_checks(official.path(), &mut field).is_err());
+        changed["establishes_sat"] = false.into();
+        changed["benchmark"]["version"] = "1.0".into();
+        std::fs::write(&check, serde_json::to_vec(&changed).unwrap()).unwrap();
+        load_published_counterexample_checks(official.path(), &mut field).unwrap();
+        assert_eq!(
+            field["tool"].values().next().unwrap().counterexample,
+            None,
+            "a different version must not authenticate the row"
+        );
+        assert_ne!(
+            organizer_row_identity(
+                &parse_csv_line(medical.trim_end_matches(['\r', '\n'])).unwrap()
+            )
+            .unwrap(),
+            organizer_row_identity(
+                &parse_csv_line(
+                    &medical
+                        .trim_end_matches(['\r', '\n'])
+                        .replace(",sat,1", ",sat,1.0"),
+                )
+                .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_ny_sat_and_validation_only_checks_never_acquire_fresh_credit() {
+        let dir = TempDir::new().unwrap();
+        let official = TempDir::new().unwrap();
+        let row = "acasxu_2023,corpus/2.0/onnx/m.onnx,corpus/2.0/vnnlib/p.vnnlib,0,sat,1\n";
+        let current = write_file(&dir, "current.csv", row);
+        write_file(
+            &official,
+            "holds/results.csv",
+            &row.replace(",sat,", ",unsat,"),
+        );
+        let mut options = opts(current.clone(), None);
+        options.official = Some(official.path().into());
+        options.year = Some(ScoreYear::Y2026);
+        options.witnesses = Witnesses::Adjudicated;
+        let report = run_score(&options).unwrap();
+        assert_eq!(report.normalized_total, Some(0.0));
+        assert_eq!(report.total_unqualified_sat, 1);
+        assert_eq!(report.field_normalized_totals["holds"], 100.0);
+
+        let check = publish_check(&official, "validation", row, CounterexampleCheck::Strict);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&check).unwrap()).unwrap();
+        let source = "a".repeat(40);
+        value["ny_evidence"] = serde_json::json!({
+            "schema": "ny_vnncomp2026_row_replay_evidence_v1", "tool": "ny",
+            "validation_only": true, "source_commit": source, "occurrence": 0
+        });
+        let checks = TempDir::new().unwrap();
+        std::fs::write(
+            checks.path().join("row.check.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let mut rows = load(&current).unwrap();
+        let error = load_ny_counterexample_checks(checks.path(), &source, &mut rows).unwrap_err();
+        assert!(error.to_string().contains("validation-only"));
+        assert!(rows.values().all(|entry| entry.counterexample.is_none()));
+    }
+
+    #[test]
+    fn a_strict_check_on_one_duplicate_occurrence_does_not_relabel_another() {
+        let dir = TempDir::new().unwrap();
+        let sat = "acasxu_2023,onnx/m.onnx,vnnlib/p.vnnlib,0,sat,1\n";
+        let current_path = write_file(&dir, "ny.csv", &sat.repeat(2));
+        let incumbent_path = write_file(
+            &dir,
+            "field.csv",
+            &sat.replace(",sat,", ",unsat,").repeat(2),
+        );
+        let mut current = load(&current_path).unwrap();
+        current.values_mut().next().unwrap().counterexample = Some(CounterexampleCheck::Strict);
+        let field = BTreeMap::from([("incumbent".into(), load(&incumbent_path).unwrap())]);
+        let score = modeled_official_score(
+            "acasxu_2023",
+            &current,
+            &field,
+            ScoreYear::Y2026,
+            ScoreTrack::Regular,
+            &BTreeSet::new(),
+            Witnesses::Adjudicated,
+            None,
+        )
+        .unwrap();
+        assert_eq!(score.current_raw, 10);
+        assert_eq!(score.current_unqualified_sat, 1);
+        assert_eq!(score.field_scores["incumbent"].raw, -140);
     }
 
     #[test]
@@ -3149,31 +4103,26 @@ mod tests {
     // Witness adjudication: an uncorroborated SAT must not set a denominator.
     // ---------------------------------------------------------------------
 
-    /// Five cgan2026 rows the organisers adjudicated `unsat`, one tool that
-    /// answers them correctly, and one tool whose SAT claim nobody reproduces.
-    ///
-    /// Shaped after the live 2026 corpus: `agate` alone claims SAT on 8
-    /// `cgan2026` rows that `cgan2026_official_truth.json` and the organisers'
-    /// own log both call `unsat`, and the organisers charged it -150 on each.
+    /// Synthetic controls for the retained historical 2025 adjudication model.
     fn planted_witness_corpus(official: &TempDir) {
         // Decides all five correctly.
         write_file(
             official,
             "honest/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p4.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p4.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
         );
         // Claims SAT on four of them and nobody corroborates it.
         write_file(
             official,
             "planted/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,sat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,sat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p4.vnnlib,0,sat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p2.vnnlib,0,sat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p3.vnnlib,0,sat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p4.vnnlib,0,sat,1\n",
         );
     }
 
@@ -3182,10 +4131,10 @@ mod tests {
         write_file(
             dir,
             "current.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
-             cgan2026,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p2.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p3.vnnlib,0,unsat,1\n\
+             cgan_2023,onnx/m.onnx,vnnlib/p5.vnnlib,0,unsat,1\n",
         )
     }
 
@@ -3194,7 +4143,7 @@ mod tests {
     }
 
     fn cgan_truth_log() -> String {
-        let mut body = String::from("Category 2026_cgan2026:\n");
+        let mut body = String::from("Category 2025_cgan_2023:\n");
         for property in ["p1", "p2", "p3", "p4", "p5"] {
             body.push_str(&format!("Row: ['m-{property}', '1.0 (h)', '1.0 (v)']\n"));
             body.push_str("True Result: unsat\n");
@@ -3230,10 +4179,10 @@ mod tests {
         // Arm A — the defect, pinned so the fix is measured against it.
         let mut broken = opts(current.clone(), None);
         broken.official = Some(official.path().to_path_buf());
-        broken.year = Some(ScoreYear::Y2026);
+        broken.year = Some(ScoreYear::Y2025);
         broken.witnesses = Witnesses::AssumedValid;
         let report = run_score(&broken).expect("assumed-valid score");
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
         assert_eq!(
             cgan.field_best_raw_score,
             Some(40),
@@ -3249,11 +4198,11 @@ mod tests {
         // Arm B — the fix. Same rows, same field, organiser truth supplied.
         let mut fixed = opts(current, None);
         fixed.official = Some(official.path().to_path_buf());
-        fixed.year = Some(ScoreYear::Y2026);
+        fixed.year = Some(ScoreYear::Y2025);
         fixed.witnesses = Witnesses::Adjudicated;
         fixed.ground_truth = Some(log);
         let report = run_score(&fixed).expect("adjudicated score");
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
         assert_eq!(
             cgan.field_best_raw_score,
             Some(50),
@@ -3291,10 +4240,10 @@ mod tests {
 
         let mut adjudicated = opts(current, None);
         adjudicated.official = Some(official.path().to_path_buf());
-        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.year = Some(ScoreYear::Y2025);
         adjudicated.witnesses = Witnesses::Adjudicated;
         let report = run_score(&adjudicated).expect("adjudicated score");
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
 
         assert_eq!(
             cgan.disputed_rows.len(),
@@ -3345,26 +4294,26 @@ mod tests {
         let current = write_file(
             &dir,
             "current.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
         );
         let official = TempDir::new().expect("official");
         write_file(
             &official,
             "first/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
         );
         write_file(
             &official,
             "second/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,sat,1\n",
         );
 
         let mut adjudicated = opts(current, None);
         adjudicated.official = Some(official.path().to_path_buf());
-        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.year = Some(ScoreYear::Y2025);
         adjudicated.witnesses = Witnesses::Adjudicated;
         let report = run_score(&adjudicated).expect("adjudicated score");
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
         assert_eq!(cgan.current_raw_score, Some(PENALTY_INCORRECT));
         assert_eq!(cgan.current_incorrect, Some(1));
         assert_eq!(cgan.current_disputed, Some(0));
@@ -3379,32 +4328,32 @@ mod tests {
         let current = write_file(
             &dir,
             "current.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
         );
         let official = TempDir::new().expect("official");
         write_file(
             &official,
             "first/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
         );
         write_file(
             &official,
             "second/results.csv",
-            "cgan2026,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
+            "cgan_2023,onnx/m.onnx,vnnlib/p1.vnnlib,0,unsat,1\n",
         );
         let truth_dir = TempDir::new().expect("truth");
         let log = organiser_log(
             &truth_dir,
-            "Category 2026_cgan2026:\nRow: ['m-p1', '1.0 (h)']\nTrue Result: sat\n",
+            "Category 2025_cgan_2023:\nRow: ['m-p1', '1.0 (h)']\nTrue Result: sat\n",
         );
 
         let mut adjudicated = opts(current, None);
         adjudicated.official = Some(official.path().to_path_buf());
-        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.year = Some(ScoreYear::Y2025);
         adjudicated.witnesses = Witnesses::Adjudicated;
         adjudicated.ground_truth = Some(log);
         let report = run_score(&adjudicated).expect("adjudicated score");
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
         assert_eq!(
             cgan.current_raw_score,
             Some(PENALTY_INCORRECT),
@@ -3450,7 +4399,7 @@ mod tests {
     #[test]
     fn an_organiser_log_with_no_true_result_rows_is_a_parse_failure() {
         let error = parse_ground_truth_log(
-            "Category 2026_cgan2026:\nsomething else entirely\n",
+            "Category 2025_cgan_2023:\nsomething else entirely\n",
             "fixture",
         )
         .expect_err("empty truth must refuse");
@@ -3464,7 +4413,7 @@ mod tests {
     /// It must claim nothing rather than being read as a decided row.
     #[test]
     fn an_undecided_organiser_row_claims_no_truth() {
-        let log = "Category 2026_cgan2026:\n\
+        let log = "Category 2025_cgan_2023:\n\
                    Row: ['m-p1', '1.0 (v)']\n\
                    True Result: -\n\
                    Row: ['m-p2', '1.0 (h)']\n\
@@ -3474,7 +4423,7 @@ mod tests {
         assert!(truth.ambiguous.is_empty());
         assert!(!truth
             .verdicts
-            .contains_key(&("cgan2026".to_string(), "m-p1".to_string())));
+            .contains_key(&("cgan_2023".to_string(), "m-p1".to_string())));
     }
 
     /// A released corpus carries its own scoring log, and pointing `--official`
@@ -3489,11 +4438,11 @@ mod tests {
 
         let mut adjudicated = opts(current, None);
         adjudicated.official = Some(official.path().to_path_buf());
-        adjudicated.year = Some(ScoreYear::Y2026);
+        adjudicated.year = Some(ScoreYear::Y2025);
         adjudicated.witnesses = Witnesses::Adjudicated;
         let report = run_score(&adjudicated).expect("adjudicated score");
         assert_eq!(report.ground_truth_resolved_instances, 5);
-        let cgan = bench(&report, "cgan2026");
+        let cgan = bench(&report, "cgan_2023");
         assert_eq!(cgan.field_best_raw_score, Some(50));
         assert_eq!(cgan.current_disputed, Some(0));
     }

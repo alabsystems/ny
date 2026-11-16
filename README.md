@@ -18,7 +18,7 @@ property, and it answers with one of:
 
 | Answer | Meaning | Evidence |
 | --- | --- | --- |
-| **verified** | The property holds on the whole input region. | On eligible networks, an exact-rational certificate that an external checker can replay. |
+| **verified** | The property holds on the whole input region. | An optional exact-rational certificate on eligible networks. |
 | **falsified** | The property can be violated. | A concrete input, re-run through the model to confirm the violation. |
 | **unknown** | `ny` could neither prove nor refute it. | The reason, such as an unsupported operator or an exhausted search budget. |
 | **timeout** | The time limit ran out first. | Elapsed time and partial progress, where available. |
@@ -37,10 +37,11 @@ the verdict path carries certified rounding-error bounds.
 
 ## Quick start
 
-`ny` needs Git, a C/C++ build toolchain, and the Trust toolchain named in
-`rust-toolchain.toml`. [aterm](https://github.com/alabsystems/aterm#install)
-manages Trust with `aterm pkg install trust`. Run `aterm help rust` in the
-checkout to check which compiler this host uses.
+`ny` needs Git, a C/C++ build toolchain, and a current Trust installation.
+`rust-toolchain.toml` selects the local `trust` alias.
+[aterm](https://github.com/alabsystems/aterm#install) manages Trust with
+`aterm pkg install trust`. Run `aterm help rust` in the checkout to check
+which compiler this host uses.
 
 ```bash
 git clone https://github.com/alabsystems/ny
@@ -90,21 +91,20 @@ Counterexample input: [0.50806665]
 | 3 | timeout |
 | 4 | invalid invocation or operational error |
 
-For CI, `ny verify --allow-unknown` maps `unknown` to 0. It never masks a
-timeout or an error.
+For CI, `ny verify --allow-unknown` maps ordinary `unknown` results to 0.
+A refused counterexample still exits 2; timeouts and errors keep their codes.
 
 New to verification? `ny tutorial` is an interactive introduction, and
 `ny tutorial demo` runs the example above.
 
 ## Checking the answers
 
-**Counterexamples** are re-executed through the model before `ny` reports
-them, and you can replay them in any inference engine.
+**Counterexamples** are re-executed through the model before `ny` reports them.
 
-**Proofs** come with a certificate on eligible networks: sequential,
-fully connected ReLU networks with up to 8192 hidden neurons. `ny` re-derives
-the CROWN bound in exact rational arithmetic, writes it as an entailment plus
-a Farkas certificate, and self-checks the certificate before writing it:
+**Certificates** are optional for sequential, fully connected ReLU networks
+with up to 8192 hidden neurons. `ny` attempts an exact-rational CROWN proof of
+a supported safety margin, then self-checks its entailment and Farkas
+certificates before writing them:
 
 ```bash
 ny beta-crown tests/models/crossing_relu.nnet \
@@ -119,9 +119,13 @@ proofs of the certificate lemmas live in
 [`crates/ny-cert/proofs/`](crates/ny-cert/proofs/README.md), whose README
 states what is proved and what is assumed.
 
-On eligible networks `beta-crown` writes `<model-stem>.cert.json` next to the
-model by default. Pass `--no-certificate` to skip it. The certificate is
-derived after the verdict, so skipping it never changes the verdict.
+By default `beta-crown` attempts `<model-stem>.cert.json` next to the model.
+Emission is best effort: unsupported properties, inconclusive exact CROWN
+derivation, exhausted budgets, or write failures can leave a verified verdict
+without a sidecar. Pass `--no-certificate` to disable optional emission;
+`--require-certificate` takes precedence and restricts verdicts to proofs the
+external format can represent. Skipping optional emission leaves the verdict
+unchanged.
 `ny vnncomp` runs under the `competition` proof profile, which skips the
 certificate and samples downgrade-only audits less often; the certifiers that
 decide a verdict run identically in both profiles.
@@ -167,7 +171,8 @@ ny benchmarks download 2025 2026                    # fetch corpora (large)
 ny benchmarks status --year 2026 --strict           # check that assets are present
 ny benchmarks run --year 2026 --category CATEGORY \
   --output reports/sweeps/run.csv                   # add --resume to continue
-ny benchmarks score --results BANK_DIR --official RESULTS_CHECKOUT --year 2026
+ny benchmarks score --results BANK_DIR --official RESULTS_CHECKOUT --year 2026 \
+  --budget-year 2026 --ny-ce-checks REPLAY_CHECKS --ny-ce-source SOURCE_COMMIT
 ny benchmarks reseed --year 2026 --category CATEGORY --limit 10
 ```
 
@@ -182,7 +187,12 @@ ny benchmarks reseed --year 2026 --category CATEGORY --limit 10
   VNN-COMP rules (+10 per correct verdict, −150 per incorrect one, no time
   bonus, normalized to each category's winner), and `--witnesses` chooses how
   disputed counterexamples count. It is a local model of the rules, not an
-  official score.
+  official score. For 2026, adjudicated mode uses published per-run checks;
+  strict SAT witnesses can penalize UNSAT, while tolerant acceptance credits
+  only its own SAT. NY SAT rows need source-bound `--ny-ce-checks`; missing
+  checks remain unqualified and receive zero. The
+  [replay exporter](scripts/export_cct_replay_checks.py) currently supports CCT
+  pilot records; run it with `--help` for the required inputs.
 - **`reseed`** re-runs instances under renamed copies of their files and
   checks that the verdicts match.
 
@@ -261,7 +271,7 @@ whatever accelerator the host has.
 
 ## Python
 
-The benchmark and replay scripts need the packages in `requirements.txt`:
+General benchmark tooling uses the packages in `requirements.txt`:
 
 ```bash
 python3 -m venv .venv
@@ -269,6 +279,9 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 make PYTHON="$VIRTUAL_ENV/bin/python" test-python-tooling
 ```
+
+Competition counterexample replay additionally requires the
+[replay script's pinned checker environment](scripts/replay_ny_counterexamples.py).
 
 If `venv` is unavailable (Debian and Ubuntu ship it separately), use
 `uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt`.
