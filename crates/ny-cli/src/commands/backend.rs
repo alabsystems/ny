@@ -338,17 +338,10 @@ where
 
 /// #flush-charge: the fail-closed WGPU proof-qualification chain.
 ///
-/// Order is part of the contract: the fully qualified (uncharged) constructor
-/// is ALWAYS attempted first, so a conforming adapter can never be downgraded
-/// into charged mode; the charged constructor is consulted only after the
-/// uncharged ladder refuses. When the charged attempt also refuses, its
-/// refusal is DISCARDED: the caller sees exactly the uncharged refusal
-/// evidence, so refusal receipts and override markers stay byte-identical to
-/// the pre-chain binary (pinned by
-/// `closed_charged_gate_keeps_the_chain_byte_identical` and the live
-/// `charged_chain_is_live_on_this_host_now_that_the_gate_is_open`). With the
-/// reviewed charged source gate OPEN (2026-08-13 review), a charged admission
-/// resolves the chain with the distinctly narrated charged evidence.
+/// Try uncharged qualification first, then charged qualification, and return
+/// the first admitted device. Charged admission carries distinct provenance.
+/// If both refuse, preserve the original uncharged refusal for receipts and
+/// backend override markers.
 fn qualify_wgpu_proof_chain<T>(
     uncharged: impl FnOnce() -> Result<(T, String, String), WgpuProofRefusal>,
     charged: impl FnOnce() -> Result<(T, String, String), WgpuProofRefusal>,
@@ -357,10 +350,7 @@ fn qualify_wgpu_proof_chain<T>(
         Ok(qualified) => Ok(qualified),
         Err(uncharged_refusal) => match charged() {
             Ok(charged_qualified) => Ok(charged_qualified),
-            // Fail-closed to CPU with the UNCHARGED evidence: with the charged
-            // gate closed this arm always runs and must not perturb today's
-            // receipt/marker bytes; with it open, the uncharged rung report
-            // remains the more diagnostic refusal.
+            // Preserve the uncharged refusal when both attempts fail.
             Err(_charged_refusal) => Err(uncharged_refusal),
         },
     }
@@ -407,10 +397,8 @@ fn wgpu_qualified_evidence(
 ///
 /// Ordinary `ComputeDevice::new(Wgpu)` is intentionally not reachable here:
 /// only the typed constructors consume a request and retain the exact device
-/// whose live admission report passed. The WGPU leg is the fail-closed chain
-/// `new_for_proof` (fully qualified) -> `new_for_proof_flush_charged`
-/// (charged-Metal; source gate OPEN since 2026-08-13, the live pure-flush
-/// ladder decides per device) -> CPU. CUDA keeps
+/// whose live admission report passed. WGPU tries `new_for_proof`, then
+/// `new_for_proof_flush_charged`, then CPU. CUDA keeps
 /// its existing precedence UPSTREAM of this resolver: an explicit CUDA
 /// resident-CROWN authority request suppresses the automatic WGPU request
 /// entirely (`resolve_automatic_wgpu_request`), so this chain only runs when
@@ -467,40 +455,16 @@ fn engine_for_sound_crown_slots(
         .then(|| std::sync::Arc::clone(engine))
 }
 
-/// #charged-metal-engagement: publish the exact QUALIFIED wgpu proof device
-/// into the process-global sound GPU CROWN engine slots
-/// (`ny_propagate::sound_gpu_gate`) that borrow-only consumers read — the
-/// deadline-preinitialized sequential/margin-row routes, the resident cut
-/// shadow, and the wide lanes.
+/// Publish the exact qualified WGPU proof engine into the sound GPU CROWN
+/// slots used by borrow-only consumers, without creating another context.
 ///
-/// The CUDA path fills these slots from `main` at startup. Proof commands
-/// deliberately skip `main`'s legacy `NY_WGPU_CROWN=1` factory (it would build
-/// a SECOND wgpu context and qualify evidence for a device other than the one
-/// the command executes on), so on wgpu hosts the slots historically stayed
-/// cold on the scored/verify routes. This closes that gap without a second
-/// context: the registered factory returns a clone of the already-materialized
-/// Arc, so the mandatory prewarm performs no GPU work and completes at
-/// qualification time — before any finite deadline authority exists. Under a
-/// deadline every route consults only the PREINITIALIZED slot
-/// (`select_lazy_backend_for_deadline`), and the projected-M2 cut-shadow seam
-/// explicitly cannot afford a lazy factory under its child deadline, hence
-/// pre-materialization here rather than lazily.
+/// [`engine_for_sound_crown_slots`] checks the receipt and engine capabilities.
+/// Factories clone the existing Arc and prewarm before finite deadlines;
+/// install-once slots retain any earlier CUDA registration. The wide slot
+/// still requires its `NY_CUDA_WIDE`/`NY_HYDRA_CROWN` request gates.
 ///
-/// Contracts respected, fail-closed:
-/// - install-once / first-install-wins: on hosts where `main` already
-///   installed a factory (CUDA), this registration silently loses and CUDA
-///   precedence is untouched;
-/// - nothing is installed unless [`engine_for_sound_crown_slots`] admits the
-///   receipt+engine pair, so no-wgpu / refused-qualification hosts stay
-///   byte-identical (no factory, no materialized slot);
-/// - the wide slot mirrors `main`'s registration: the factory is installed,
-///   but the lane stays dark unless its exact request gates
-///   (`NY_CUDA_WIDE`/`NY_HYDRA_CROWN` — backend-agnostic despite the names)
-///   are set, and then it too must be materialized pre-deadline;
-/// - the sound-f64 GEMM seam (`sound_f64_gemm`) is deliberately NOT filled:
-///   its contract assumes an IEEE f64 `Dgemm` (cuBLAS/Accelerate) and the
-///   charged device is f32-only — substituting it there would be an assumption,
-///   not a qualification. Only the capability-typed CROWN slots are published.
+/// The sound-f64 GEMM slot is untouched: its IEEE f64 contract cannot be
+/// satisfied by the charged device's f32-only qualification.
 pub(crate) fn register_qualified_wgpu_proof_engine(
     receipt: &ProofBackendReceipt,
     engine: &std::sync::Arc<dyn GemmEngine>,
@@ -608,10 +572,11 @@ pub(crate) fn resolve_backend(backend: BackendArg, gpu: bool) -> BackendArg {
     }
 }
 
-/// Apply preset `general.device` as a fallback when no CLI flag overrides.
+/// Apply preset `general.device` to the unresolved CPU default.
 ///
-/// Precedence: --backend > --gpu > preset general.device > CPU default.
-/// Only activates when `cli_backend` is CPU and `gpu` is false (no explicit CLI override).
+/// Non-CPU selections and legacy `--gpu` take precedence. This helper cannot
+/// distinguish default CPU from explicit `--backend cpu`; the caller must
+/// preserve an explicit CPU request before applying the preset.
 pub(crate) fn apply_preset_device(
     cli_backend: BackendArg,
     gpu: bool,

@@ -25,8 +25,8 @@ gpu-tests = []
 # this lane there fails each test naming the refusal; the plain `gpu-tests`
 # lane stays meaningful on such a host. See TEST_CONFORMANCE.md.
 gpu-tests-uncharged = ["gpu-tests"]
-# Explicit CUDA small-row sound-fold conformance. Constructs a real device and
-# fails if unavailable; never enabled by the portable GPU/CPU test lanes.
+# CUDA small-row sound-fold and packed-root conformance. Requires a real device;
+# fails if unavailable and is absent from the portable GPU/CPU test lanes.
 gpu-tests-cuda = []
 # Diagnostic harnesses that PRINT observed behaviour for re-seeding a pinned
 # guard, rather than asserting anything. They are tools, not coverage, so they

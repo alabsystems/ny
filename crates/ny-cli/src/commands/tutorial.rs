@@ -15,7 +15,7 @@ const CROSSING_RELU_NNET: &[u8] = include_bytes!("tutorial/crossing_relu.nnet");
 const CROSSING_RELU_SAFE: &[u8] = include_bytes!("tutorial/crossing_relu_safe.vnnlib");
 const CROSSING_RELU_UNSAFE: &[u8] = include_bytes!("tutorial/crossing_relu_unsafe.vnnlib");
 
-/// Interactive lessons for neural-network verification.
+/// Verification lessons and a live demo.
 #[derive(Debug, Subcommand)]
 pub(crate) enum TutorialTopic {
     /// Fundamentals of neural-network verification, in five short lessons
@@ -157,9 +157,9 @@ fn basics() {
     println!(
         "
   A falsified verdict comes with a concrete input, which ny re-runs through the
-  model to confirm the violation before printing it — you can re-run it too. A
-  verified verdict, on eligible networks, comes with an exact-rational
-  certificate an external checker can replay.
+  model to confirm the violation before printing it — you can re-run it too.
+  On eligible networks, ny also attempts an optional exact-rational certificate
+  an external checker can replay.
 
   See it run:      ny tutorial demo
   See the proof:   ny tutorial certificates
@@ -210,9 +210,9 @@ fn certificates() {
   the model to confirm the violation before printing it. You can replay it
   independently against the same model and property.
 
-  A PROOF is what backs a `verified` verdict. On a sequential fully-connected
-  ReLU network (up to 8192 hidden neurons), ny re-derives the CROWN bound in
-  exact rational arithmetic and writes an entailment + Farkas certificate:
+  An EXTERNAL CERTIFICATE is optional evidence for a `verified` verdict. On a
+  sequential fully-connected ReLU network (up to 8192 hidden neurons), ny
+  attempts an exact-rational CROWN proof with entailment + Farkas certificates:
 
       ny beta-crown model.nnet -p prop.vnnlib --emit-certificate model.cert.json
 
@@ -221,6 +221,11 @@ fn certificates() {
   empty the unsafe region. No floating point, no reference to ny's solver state.
   The external kernel checker, Clean, replays the certificate. The Lean corpus
   in crates/ny-cert/proofs/ documents the proof lemmas and their assumptions.
+
+  Emission is best effort: an unsupported property, inconclusive derivation,
+  budget limit, or write failure can leave a verified verdict without a file.
+  `--no-certificate` disables optional emission; `--require-certificate` takes
+  precedence and restricts verdicts to proofs the external format can represent.
 
   Related evidence:
       ny lipschitz model.onnx        sound certified global Lipschitz bound
@@ -236,7 +241,7 @@ fn features() {
         "
   Verification
       ny verify        incomplete bounds (ibp | crown | alpha; beta is sequential-only)
-      ny beta-crown    complete branch-and-bound; returns proofs or counterexamples
+      ny beta-crown    branch-and-bound verification and counterexample search
       ny vnncomp       run one VNN-COMP instance under the competition protocol
       ny gt            verify against a geometric ground-truth spec (exact SMT escalation)
 

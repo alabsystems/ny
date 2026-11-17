@@ -81,6 +81,8 @@ use ny_core::{
 
 mod ieee_selfcheck;
 mod joint_alpha;
+/// Independently qualified ordered paired-f32 compact-root arithmetic.
+pub mod packed_root;
 /// #wide-fd-search (ENGINE_PROGRAM M4): the device level search for the
 /// frozen-dual tier, an UNTRUSTED `ny_core::search::SearchBackend` — the CPU
 /// f32 search's kernels, bit for bit, in a CUDA context of their own, lazily

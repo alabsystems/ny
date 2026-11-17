@@ -58,6 +58,7 @@ mod prepared_domain_eval;
 pub(in crate::margin_row) use prepared_domain_eval::evaluate_prepared_domain;
 mod prepared_root_eval;
 mod prepared_tree;
+mod root_eval_progress;
 pub use prepared_tree::{
     PreparedTreeCertificate, PreparedTreeOpen, PreparedTreeOpenReason, PreparedTreeOptions,
     PreparedTreeOutcome, PreparedTreeReceipt, PreparedTreeSchedule,
@@ -266,10 +267,8 @@ pub struct BabConfig {
     /// Immutable authority for rebakes and nested epoch roots. Execution
     /// evidence is deliberately not read back into this policy.
     pub root_precision_policy: super::RootPrecisionRuntimePolicy,
-    /// #epoch-carry: the RUN's backward-interm policy, so a Tier-2 epoch rebuild
-    /// can re-run BI instead of discarding the root's tightening. `try_epoch`
-    /// previously passed `BackwardIntermRuntimePolicy::default()` (enabled:
-    /// false), which is why arming the epoch measured as a bound REGRESSION.
+    /// Run's backward-intermediate policy, carried into rebuild requests.
+    /// The root builder excludes split epoch rebuilds from BI.
     pub backward_interm_policy: super::BackwardIntermRuntimePolicy,
     /// Root-build execution evidence for the root-precision family.
     pub root_precision_execution: super::RootPrecisionExecutionEvidence,
@@ -3390,6 +3389,15 @@ pub(super) fn build_pack(
     dom: Option<&DomainGates>,
     splits: &[TrunkSplit],
 ) -> Result<YPack> {
+    build_pack_traced(eng, dom, splits, None)
+}
+
+fn build_pack_traced(
+    eng: &BackwardEngine<'_>,
+    dom: Option<&DomainGates>,
+    splits: &[TrunkSplit],
+    trace: Option<&root_eval_progress::Evaluation>,
+) -> Result<YPack> {
     let head_group_source = if dom.is_none() && splits.is_empty() {
         super::head_group_source::YPackSource::capture(eng)
     } else {
@@ -3400,6 +3408,7 @@ pub(super) fn build_pack(
     // needed, and one device walk publishes BOTH lanes. Dark + fail-closed:
     // with `NY_MARGIN_ROW_GPU` unset this is the established `y_rows` call.
     let (al, au) = {
+        let stage = trace.and_then(|t| t.stage("y_rows", 2 * eng.net.n_y));
         // #mr-census: two identity-seeded passes of n_y columns each.
         let _census = super::census::SiteTimer::start(super::census::Site::YRows, 2 * eng.net.n_y);
         let t_rows = Instant::now();
@@ -3416,8 +3425,10 @@ pub(super) fn build_pack(
         };
         // #root-eval-reuse: what a rows-memo hit saves (read by the store).
         LAST_Y_ROWS_NS.with(|c| c.set(super::census::elapsed_ns(t_rows)));
+        root_eval_progress::Stage::finish(stage);
         rows
     };
+    let stage = trace.and_then(|t| t.stage("pack_tail", eng.net.n_y));
     let mut pack = pack_from_rows(eng, al, au);
     clip_tighten_pack(eng, splits, &mut pack);
     pack.head_group_source = head_group_source.and_then(|mut source| {
@@ -3425,6 +3436,7 @@ pub(super) fn build_pack(
             .seal_rows(&pack.al, &pack.au, &pack.ly0, &pack.uy0)
             .then_some(source)
     });
+    root_eval_progress::Stage::finish(stage);
     Ok(pack)
 }
 
@@ -4179,8 +4191,10 @@ fn root_eval_impl(
     // #mr-census: one call per root evaluation actually computed (the L1
     // root-eval dedupe shows up here as FEWER calls, not cheaper ones).
     let _census = super::census::SiteTimer::start(super::census::Site::RootEval, adv.len());
+    let mut progress = root_eval_progress::Evaluation::new(net.n_in, net.n_y, adv.len());
     let mode = eng.root.mode;
-    let pack = Arc::new(build_pack(eng, None, &[])?);
+    let pack = Arc::new(build_pack_traced(eng, None, &[], Some(&progress))?);
+    let stage = progress.stage("head_seed", adv.len());
     let ybox = YBox {
         ly: pack.ly0.clone(),
         uy: pack.uy0.clone(),
@@ -4219,6 +4233,8 @@ fn root_eval_impl(
     let mb_all = MarginBatch::new(net, t, adv)?;
     let gates = head_gates_with(&ybox, mode, eng.root.head_alpha.as_deref());
     let ms_all = margin_seed(&mb_all, &gates, &ybox, mode);
+    root_eval_progress::Stage::finish(stage);
+    let stage = progress.stage("compose_viay", adv.len());
     let m2v_all = compose_viay(
         eng,
         &mb_all,
@@ -4229,6 +4245,8 @@ fn root_eval_impl(
         &pack.au_dots,
         mode,
     );
+    root_eval_progress::Stage::finish(stage);
+    let stage = progress.stage("screen_classes", adv.len());
     let mut dj = Vec::with_capacity(adv.len());
     for (&m1, &m2v) in ms_all.m1.iter().zip(&m2v_all) {
         require_finite("root component", &[m1, m2v])?;
@@ -4238,7 +4256,9 @@ fn root_eval_impl(
     let fail: Vec<usize> = (0..adv.len())
         .filter(|&k| !root_schedules_closed(mode, dj[k]))
         .collect();
+    root_eval_progress::Stage::finish(stage);
     if !fail.is_empty() {
+        let stage = progress.stage("direct_seed", fail.len());
         let fail_classes: Vec<usize> = fail.iter().map(|&k| adv[k]).collect();
         let mbf = MarginBatch::new(net, t, &fail_classes)?;
         let ms_f = margin_seed(&mbf, &gates, &ybox, mode);
@@ -4256,20 +4276,22 @@ fn root_eval_impl(
             y_abs: Some(&y_abs),
             deadline: None,
         };
+        root_eval_progress::Stage::finish(stage);
+        let stage = progress.stage("direct_pass", fail.len());
         let pass = eng.run_seamed(&ms_f.seed, None, super::engine::LaneDir::Lower, &seam)?;
+        root_eval_progress::Stage::finish(stage);
+        let stage = progress.stage("direct_concretize", fail.len());
         let direct = per_class_direct(eng, &pass, &ms_f, 0..fail.len());
         for (fi, &k) in fail.iter().enumerate() {
             require_finite("direct root bound", &[direct[fi]])?;
             dj[k] = dj[k].max(direct[fi]);
         }
-        // ---- #spec-alpha: the ONLY addition to this function. One `Option`
-        // discriminant test when dark. When armed it runs additional certified
-        // passes whose COLUMNS are (hardest class, candidate alpha) pairs and
-        // folds them into `dj` by ELEMENT-WISE MAX -- so `dj_armed[k] >=
-        // dj_dark[k]` identically, for every k, for every candidate. That max
-        // IS the guard: it is per class, it is evaluated on the PUBLISHED
-        // frame, and it needs no rollback state because nothing is mutated.
+        root_eval_progress::Stage::finish(stage);
+        // #spec-alpha: certified passes pair classes with candidate alphas.
+        // Per-class max on the published frame can only raise `dj`; the
+        // refinement leaves that frame unchanged, so no rollback is needed.
         if let Some(pol) = eng.root.spec_alpha_policy {
+            let stage = progress.stage("spec_alpha", fail.len());
             spec_alpha_report = Some(super::spec_alpha::refine(
                 eng,
                 net,
@@ -4281,19 +4303,24 @@ fn root_eval_impl(
                 &fail_classes,
                 &mut dj,
             ));
+            root_eval_progress::Stage::finish(stage);
         }
     }
+    let stage = progress.stage("publish", adv.len());
     require_finite("combined root bound", &dj)?;
     let tree_classes: Vec<usize> = (0..adv.len())
         .filter(|&k| !root_schedules_closed(mode, dj[k]))
         .map(|k| adv[k])
         .collect();
-    Ok(RootEval {
+    let result = RootEval {
         dj,
         tree_classes,
         pack,
         spec_alpha: spec_alpha_report,
-    })
+    };
+    root_eval_progress::Stage::finish(stage);
+    progress.finish(result.tree_classes.len());
+    Ok(result)
 }
 
 /// Build the deterministic classwise work list from root bounds aligned with
@@ -9678,20 +9705,11 @@ impl<'a> MarginRowBab<'a> {
                 self.cfg.retain_cfg.as_ref(),
                 &abs,
                 self.cfg.root_precision_policy,
-                // #epoch-carry: the RUN's BI policy, not `default()` (enabled:
-                // false). Passing the default made every epoch rebuild discard
-                // the root's #backward-interm tightening — the decl records 584
-                // discarded columns on idx_4169 — while `inherit_parent_intervals`
-                // then paid +0.0732 to claw part of it back AFTER the walk, which
-                // recovers the intervals but none of the downstream compounding.
+                // Carry the run policy; split epoch rebuilds do not rerun BI.
                 self.cfg.backward_interm_policy,
-                // #epoch-carry: seed the rebuild with the root's alpha instead of
-                // re-deriving the `gates_from_box` area heuristic. Sound because
-                // ANY alpha in [0,1] is a valid lower relaxation, and
-                // `build_retaining_inner` re-derives `ms = max(alpha, s)` from the
-                // seeded alpha on commit, which is the one alpha-coupled certified
-                // quantity. Without this an epoch throws away `alpha_opt`'s gain
-                // (+0.019..+0.059 measured 2026-08-30) on every fire.
+                // #epoch-carry: preserve optimized alpha rather than restoring
+                // the area heuristic. Each alpha in [0,1] is a valid lower line;
+                // the builder recomputes the error factor ms = max(alpha, s).
                 Some(&epoch_alpha_seed),
             );
             let Ok(pair) = built else {
@@ -9706,19 +9724,9 @@ impl<'a> MarginRowBab<'a> {
             };
             pair
         };
-        // #epoch-monotone. MEASURED 2026-08-22 on cifar100 idx_4169 at the
-        // official budget: the rebuild's root bound came out -0.389998 against
-        // the parent tree's -0.371373 — WORSE, on a domain with four neurons
-        // FIXED, which is a strict subset of the parent region and can only
-        // have a better true bound. The cause is visible in the log ordering:
-        // `build_retaining` is the ROOT BUILD, and the #backward-interm phase
-        // that tightened 584 intermediate columns for 7.11 s is applied
-        // separately at lane setup and never re-run for the nested tree. So the
-        // rebuild was trading 584 tightened columns for 4 fixed neurons and
-        // losing. That is the whole reason this mechanism was built, measured
-        // once, and left dark.
-        //
-        // The fix costs nothing and makes the rebuild MONOTONE BY CONSTRUCTION.
+        // #epoch-monotone: intersect the parent's certified intervals into full
+        // rebuilds before nested search. A fresh relaxation can be looser even
+        // on a smaller domain; inheritance preserves the interval tightening.
         if !incremental && !self.inherit_parent_intervals(&mut eroot, &abs) {
             // Intersection found a crossed interval, or the frames did not
             // line up. Fail-open to normal expansion: this path may never

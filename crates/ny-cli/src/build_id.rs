@@ -389,23 +389,17 @@ fn hex(digest: &[u8]) -> String {
     encoded
 }
 
-/// The free stamp line, computed once per process.
+/// The build stamp line, computed once per process without hashing the executable.
 ///
-/// Deliberately the STAMP and not the content-addressed id: this is called on
-/// the scored per-instance path, where hashing a 133 MB executable would be
-/// charged against budgets as small as 10 s — and the child has nothing to
-/// compare a hash against anyway. Content addressing belongs to the harness
-/// that owns the file across rows ([`BinaryIdentityGuard`]).
+/// Per-instance calls avoid repeated hashing; the harness's
+/// [`BinaryIdentityGuard`] owns content verification across rows.
 pub(crate) fn current_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| BuildStamp::current().canonical_line())
 }
 
-/// Emit the identity line to stderr exactly once per process.
-///
-/// `eprintln!`, not `tracing`, for the same reason `compute_backend::log_once`
-/// uses it: every scored entry point runs under `RUST_LOG=error`, so an
-/// info-level line is invisible exactly where provenance matters.
+/// Emit the identity line to stderr once per process, independently of the
+/// tracing filter.
 pub(crate) fn log_once() {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     LOGGED.get_or_init(|| eprintln!("{}", current_line()));

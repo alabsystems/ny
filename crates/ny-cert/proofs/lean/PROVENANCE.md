@@ -10,7 +10,7 @@ The local Lake package is `nyproof`, its library is `NyProof`, and Clean's
 
 ```text
 repository: https://github.com/alabsystems/clean.git
-revision:   fae0c94829740c9ffe527eeeb4ea472f9c08001b
+revision:   bc05e5f8b2fb4336dc20112503dfe0d90f80c69d
 subDir:     crown-proofs/lean
 ```
 

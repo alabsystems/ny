@@ -1,9 +1,9 @@
 # ny-cli external conformance
 
-The default test suite is hermetic. Tests that authenticate downloaded models,
-official properties, or an external solver live in explicit feature lanes. A
-selected lane treats missing inputs as a failure; it never reports success
-after checking nothing.
+Downloaded-model and external-solver tests use explicit feature lanes that
+fail when prerequisites are missing. Two legacy ACAS row-84 controls also run
+in the default suite: they return early if the optional 2023 corpus is absent
+and fail if it is present but damaged. An early return gives no corpus coverage.
 
 ## VNN-COMP corpus lane
 

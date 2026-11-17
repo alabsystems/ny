@@ -26,9 +26,7 @@ pub(crate) fn handle_coverage_command(json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build the machine-readable manifest: bucket counts plus the op names in each
-/// soundness class. Keys are the stable soundness-class labels (the `loose`
-/// field is surfaced under its full `sound_but_loose` name for consumers).
+/// Counts and op names keyed by their stable soundness-class labels.
 fn coverage_json(report: &CoverageReport) -> Value {
     json!({
         "total": report.total(),
@@ -46,9 +44,7 @@ fn coverage_json(report: &CoverageReport) -> Value {
             "sound_but_loose": report.loose,
             "unsupported": report.unsupported,
         },
-        // The taxonomy caveat travels WITH the machine-readable data (not only in
-        // the text footer) so a consumer piping this JSON into a report cannot
-        // over-read "translatable" as "implemented + numerically sound today".
+        // Keep the taxonomy caveat in machine-readable output too.
         "note": "Soundness TAXONOMY, not current translate() implementation status: \
                  a 'translatable' op may still be refused today with an UnsupportedOp \
                  error (fail-closed). The exact/sound/sound_but_loose classes describe \
@@ -57,12 +53,10 @@ fn coverage_json(report: &CoverageReport) -> Value {
     })
 }
 
-/// Build the human-readable manifest report as a single string (so the exact
-/// output is unit-testable without capturing stdout).
+/// Render the manifest without writing to stdout.
 fn coverage_text(report: &CoverageReport) -> String {
     let mut out = String::new();
-    // These pushes are infallible (writing into a String never errors); the
-    // `let _ =` keeps clippy quiet without masking a real fallible write.
+    // Writing to a String is infallible.
     let _ = writeln!(out, "NY trace-bridge soundness-coverage manifest");
     let _ = writeln!(out, "===========================================");
     let _ = writeln!(out, "Total TraceOp variants classified: {}", report.total());
@@ -198,22 +192,7 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap().to_owned())
             .collect();
-        // Spot-check the must-refuse ops appear in the manifest.
-        //
-        // Trimmed as the bridge grew real lowerings — the manifest is a
-        // taxonomy, so an op leaves this list the moment a sound lowering
-        // exists, and pinning a stale name here would misreport coverage:
-        //   - `Argmax` / `Argmin` / `ArgSort` are now Sound (exact index
-        //     under interval separation, [0, n-1] hull otherwise) and `Sort`
-        //     Exact (monotone, tie-agnostic order statistics).
-        //   - `WhereCond` is now sound_but_loose (union-hull select).
-        //   - `Topk` left the list at e4abe1110: the bridge lowers it now that
-        //     nn serializes the largest/sorted flags (SoundButLoose for
-        //     `sorted: false`), so pinning it here misreported coverage — this
-        //     stale pin held every stream's `--bin ny` gate red for a day.
-        //   - `Custom` moved to sound_but_loose at INC-FINAL: the explicit
-        //     opaque escape hatch lowers to the vacuous-but-sound ±inf
-        //     OpaqueSkip.
+        // Pin representative operators in their current taxonomy buckets.
         for op in ["Scatter", "MoeGating", "GridSample"] {
             assert!(
                 unsupported.iter().any(|o| o == op),

@@ -26927,27 +26927,11 @@ fn invoke_beta_crown(
 ) -> Result<()> {
     // #phase-cost: see `ny_core::phase_cost` (observability only).
     let _phase_cost = ny_core::phase_cost::enter(ny_core::phase_cost::CostPhase::Verify);
-    // GPU capability HINT for the AUTO size gate, not a backend force: the
-    // per-instance decision still applies — LARGE conv-dominated inputs (>1000
-    // elements) go to the GPU, while small input-split nets (acasxu = 5 inputs,
-    // cersyve = 4, …) stay on the CPU input-split BaB, which is materially
-    // faster for them. See `accelerator_capability_hint` for how the hint is
-    // resolved.
-    //
-    // REGRESSION FIX (#vnncomp-gpu-routing): this used to be threaded into the
-    // legacy `--gpu` FORCE parameter, which `resolve_beta_crown_backend` treats as
-    // an UNCONDITIONAL override to wgpu — bypassing the size gate. On a GPU box that
-    // forced every ACAS instance onto the GPU input-split path, turning ~12-14s CPU
-    // `unsat` verifications (prop_4 net_1_1, prop_3 net_1_2) into `unknown` timeouts
-    // at the full budget. We now pass it as the hint only; an explicit human
-    // `--gpu` on `ny beta-crown` remains a deliberate force (separate call site).
-    //
-    // SOUNDNESS (#vnncomp-gpu-crown-soundness): unchanged. This only alters backend
-    // SELECTION, and BOTH backends are sound (CPU and GPU yield the same verdict).
-    // The `ProofOpts` below still engage the process-global gate in
-    // `handle_beta_crown_command` (`ny_propagate::set_sound_gpu_crown_required`) so
-    // verdict-deciding CROWN runs on the proven-sound CPU path; GPU is used only for
-    // GEMM, IBP forward, and PGD/attack, which cannot produce an unsound Verified.
+    // #vnncomp-gpu-routing: pass capability to AUTO, never the legacy --gpu
+    // override. Without a preset device, AUTO requests wgpu only above the input
+    // size threshold; runtime policy and qualification still decide execution.
+    // The handler admits qualified sound GPU proof operations or CPU fallback;
+    // backend selection does not guarantee identical verdicts or runtimes.
     let gpu_available = accelerator_capability_hint();
 
     handle_beta_crown_command(
@@ -27019,34 +27003,19 @@ fn invoke_beta_crown(
         false,              // gpu: NO legacy force — GPU_AVAILABLE is a capability
         // hint, not an unconditional wgpu override (#vnncomp-gpu-routing).
         Some(gpu_available), // gpu_available: explicit GPU_AVAILABLE or cached CUDA/WGPU
-        // capability feeds AUTO: large conv -> accelerated attack route, ACAS -> CPU.
+        // AUTO still requires runtime policy and qualification.
         None,  // input_split_metrics_jsonl
         None,  // domain_batch_metrics_jsonl
         true,  // json: REQUIRED so the verdict is rendered and captured
         false, // gpu_bab
         false, // no_la_warm_start
-        // Match the `beta-crown` clap DEFAULTS exactly (what run_instance.sh got by
-        // not passing these flags), NOT the bare type `Default`: `complete_verifier`
-        // defaults to `Auto` (BaB, then sound HiGHS-MIP escalation when inconclusive)
-        // and `mip_solver` to `None` (preset-driven: the category preset's
-        // `solver.mip.mip_solver` selects the backend — sat_relu pins scip — with
-        // a HiGHS fallback). Passing the type `Default` for MipSolverArg (`AY`,
-        // the disabled SMT stub) would silently route every escalation into the
-        // stub and DROP sound MIP verdicts as `unknown`.
+        // Match beta-crown's CLI defaults; the handler resolves the preset's
+        // complete verifier and the ay-only solver before dispatch.
         CompleteVerifierArg::Auto,
         None::<MipSolverArg>,
-        // #soundness-spine M2a: the scored path runs under the profile the
-        // entry point froze (`competition` unless `--proof-profile proof` was
-        // given for a banking/moat run). Verdict authority is identical in
-        // both: runtime-certified verdicts publish, and only
-        // `--require-certificate` (never set here) makes certificate export
-        // verdict-bearing. The inline ny-cert sidecar stays OFF in BOTH
-        // profiles on this entry point (R5: proof artifacts are hints for an
-        // offline checker, never inline capture before publication — the
-        // sidecar pass runs before the scored flow publishes, and it has no
-        // post-publication hook yet), so a Proof-profile moat run cannot lose
-        // a verdict to artifact work. The profile still selects the audit
-        // rates.
+        // Honor the entry point's frozen profile: competition unless overridden.
+        // Verdict certifiers are identical; the profile controls sinks and audits.
+        // Inline certificate emission stays disabled; no certificate is required.
         ProofOpts {
             profile: ny_core::proof_profile::frozen().unwrap_or(
                 ny_core::proof_profile::ResolvedProofProfile::resolve(
@@ -37585,23 +37554,8 @@ mod tests {
         .is_none());
     }
 
-    /// The ACAS row-84 model, or `None` when the OPTIONAL `vnncomp2023`
-    /// benchmark download is simply not present on this host.
-    ///
-    /// The two row-84 pins below used to assert `onnx.is_file()` with the
-    /// message "tracked ACAS model fixture is missing". That message was wrong:
-    /// `benchmarks/vnncomp2023` is GITIGNORED (`benchmarks/.gitignore:6`) with
-    /// zero tracked files, so the model is a download, not repo content. On any
-    /// host that has not run `benchmarks/download_benchmarks.sh` — a fresh
-    /// clone, a `git worktree`, the competition image — those two tests were the
-    /// only red in an otherwise green 1822-test suite, which is precisely the
-    /// ambient noise that trains people to skim past a REAL failure.
-    ///
-    /// The original intent is still served, and deliberately: a missing
-    /// download is a loud SKIP, but a benchmark tree that exists while THIS
-    /// model is missing is a broken checkout and still fails hard. The
-    /// distinction is the whole point — "absent because optional" and "absent
-    /// because damaged" are different facts and must not share an outcome.
+    /// Optional downloaded ACAS row-84 model. An absent corpus returns `None`
+    /// with no execution evidence; a present but damaged corpus fails.
     fn acas_row84_model_or_skip() -> Option<PathBuf> {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let onnx = repo_root.join(
@@ -37624,10 +37578,10 @@ mod tests {
         None
     }
 
-    /// Row 84 recovery pin using only tracked immutable fixtures. The published
-    /// ACAS 5_3 / prop_2 witness sits a few f32 ULPs outside three decimal f64
-    /// faces; clamping it to the shared inward search box must retain a strict
-    /// trusted-ORT violation and pass the unchanged terminal gate.
+    /// Row 84 recovery pin using the optional model and tracked property.
+    /// The published ACAS 5_3 / prop_2 witness sits a few f32 ULPs outside three
+    /// decimal f64 faces; clamping it to the shared inward search box must
+    /// retain a strict trusted-ORT violation and pass the terminal gate.
     #[test]
     fn acas_row84_inward_snapped_witness_has_strict_margin_and_passes_gate() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

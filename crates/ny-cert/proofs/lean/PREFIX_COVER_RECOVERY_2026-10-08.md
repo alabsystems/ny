@@ -150,7 +150,7 @@ PrefixCover queries use only `propext` and/or `Quot.sound`, or no axioms.
 
 All ten dependency Git HEADs equal the exact `lake-manifest.json` revisions and
 are tracked-clean. They include Clean
-`fae0c94829740c9ffe527eeeb4ea472f9c08001b` and Mathlib
+`bc05e5f8b2fb4336dc20112503dfe0d90f80c69d` and Mathlib
 `c5ea00351c28e24afc9f0f84379aa41082b1188f`; the complete list and independent
 verification are in the evidence packet. This qualification applies to the
 official Lean overlay, with its stated dependencies and trust base.

@@ -238,7 +238,7 @@ pub(crate) struct AcasxuBenchmarkArgs {
     /// Include individual results in JSON output.
     pub(crate) include_results: bool,
     /// Branching heuristic (width, impact/babsr, fsb/kfsb, sequential, input).
-    /// With `gpu_bab=true`, only `impact`/`babsr` is currently supported.
+    /// With `gpu_bab=true`, use `impact`/`babsr` or `input`.
     pub(crate) branching: String,
     /// Maximum domains to explore
     pub(crate) max_domains: usize,

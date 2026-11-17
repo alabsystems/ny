@@ -29,102 +29,49 @@ const BASE_TOKENS: &[&str] = &[
     "input",
 ];
 
-/// Extended token only accepted by `beta_crown verify` (triggers ReLU splitting).
+/// Extended token accepted by `ny beta-crown` (triggers ReLU splitting).
 pub(crate) const RELU_TOKEN: &str = "relu";
 
 /// Token requesting model-intrinsic auto-selection of the branching method.
 ///
-/// This is the DEFAULT value of `--branching` for `beta_crown verify`. It is
+/// This is the default value of `--branching` for `ny beta-crown`. It is
 /// resolved into a concrete [`BranchingHeuristic`] once the model + spec are
 /// loaded (see [`auto_select_branching`]). `auto` defers to a preset's
 /// `bab.branching.method` when one is declared (so benchmark presets keep
 /// control), and otherwise self-selects from the model's structure.
 pub(crate) const AUTO_TOKEN: &str = "auto";
 
-/// Input element-count threshold below which input-splitting is *unconditionally*
-/// preferred (the "low-dim input" class).
-///
-/// Networks whose input is low-dimensional (e.g. ACAS-Xu = 5, TLLVerifyBench = 2,
-/// control-system state vectors of 4-6, nn4sys lindex = 1, sat_relu = 30, cgan
-/// latent = 5) verify far better with INPUT splitting than with ReLU (kFSB)
-/// splitting: the input box is tightened directly and ReLU-splitting exhausts its
-/// domain budget without closing the bound. ReLU splitting only pays off once
-/// there is a large unstable-neuron frontier, which low-dim nets don't have.
-///
-/// The in-repo VNN-COMP low-dim input-split categories all sit at <= 30 inputs
-/// (sat_relu = 30 is the largest); 64 leaves a robust margin above them while
-/// staying well below the smallest moderate/high-dim category considered by the
-/// structural rules (collins_rul = 400). The low-dim ReLU-split category
-/// safenlp (= 30, NLP) is disambiguated by the MIP complete-verifier signal, not
-/// by input dimensionality.
+/// Inclusive input-count ceiling for the low-dimensional input-split rule.
+/// The MIP complete-verifier rule takes precedence, even below this ceiling.
 pub(crate) const INPUT_SPLIT_MAX_INPUT_DIM: usize = 64;
 
-/// Upper bound on input element count for the "moderate-dim small/shallow net"
-/// input-split class.
-///
-/// Above [`INPUT_SPLIT_MAX_INPUT_DIM`] but at/below this value, input splitting is
-/// still the right call *iff* the network is structurally small (few parameters
-/// AND few ReLU nodes): the input box can be fanned out and the small,
-/// few-unstable-neuron net converges before the domain budget is exhausted. This
-/// is the "dist_shift class": dist_shift = 792 inputs over a small conv/FC MNIST
-/// autoencoder wants INPUT splitting even though 792 > [`INPUT_SPLIT_MAX_INPUT_DIM`].
-///
-/// The band stops at 2048 so that genuinely high-dimensional image / transformer
-/// inputs (CIFAR = 3072, ViT = 3072, traffic_signs = 12288, TinyImageNet = 9408,
-/// VGGNet = 150528) are never eligible — those have a huge unstable-neuron
-/// frontier and are hopeless for input splitting regardless of param count.
+/// Inclusive input-count ceiling for the moderate-input small/shallow rule.
+/// Above [`INPUT_SPLIT_MAX_INPUT_DIM`], both [`MODERATE_NET_MAX_PARAMS`] and
+/// [`MODERATE_NET_MAX_RELU`] must also hold for input splitting.
 pub(crate) const MODERATE_INPUT_SPLIT_MAX_INPUT_DIM: usize = 2048;
 
-/// Max parameter count for the "moderate-dim small/shallow net" input-split class.
-///
-/// dist_shift's small MNIST autoencoder is well under this; image/feature CNNs in
-/// the same input band (e.g. collins_rul) carry many more parameters and a far
-/// larger unstable-ReLU frontier, so they correctly fall through to ReLU (kFSB)
-/// splitting. Used in conjunction with [`MODERATE_NET_MAX_RELU`] — BOTH must hold,
-/// so a small-parameter-but-deep net or a shallow-but-huge net is not mistaken for
-/// the dist_shift class.
+/// Inclusive parameter-count ceiling for the moderate-input rule.
 pub(crate) const MODERATE_NET_MAX_PARAMS: usize = 2_000_000;
 
-/// Max ReLU-family node count for the "moderate-dim small/shallow net" class.
-///
-/// Counts ReLU / LeakyReLU / PReLU activation *nodes* (not individual neurons) as a
-/// cheap proxy for network depth / the size of the unstable-neuron frontier.
-/// A handful of activation layers (autoencoder-scale) keeps input splitting
-/// tractable; many activation layers (deep conv / transformer stacks) imply a
-/// large unstable frontier where ReLU splitting wins.
+/// Inclusive ReLU-family node-count ceiling for the moderate-input rule.
+/// Counts ReLU, LeakyReLU and PReLU nodes, rather than individual neurons.
 pub(crate) const MODERATE_NET_MAX_RELU: usize = 64;
 
-/// Max-domains budget applied when `auto` selects input splitting and the user
-/// did not pass an explicit `--max-domains`.
-///
-/// Mirrors the input-split companion budget the VNN-COMP runner used
-/// (`--max-domains 50000` for the input-split categories; see
-/// `vnncomp_scripts/run_instance.sh`). Input splitting fans the input box into
-/// many subdomains, so it needs a larger frontier than the ReLU-split default;
-/// this keeps auto-selected input splitting behaving like the hand-tuned
-/// configuration. SOUND: a domain cap only bounds search effort — hitting it
-/// yields `unknown`/`timeout`, never a wrong verdict.
+/// Raised domain cap for auto-selected input splitting when the CLI omitted
+/// `--max-domains` and the resolved cap still equals the default. This is a
+/// value comparison; an equal-valued preset also meets that condition.
 pub(crate) const AUTO_INPUT_SPLIT_MAX_DOMAINS: usize = 50_000;
 
 /// Why [`auto_select_branching`] chose a particular method (for logging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoBranchingReason {
-    /// MIP is the active complete verifier (SAT-encoded / NLP / malware-Conv):
-    /// CROWN is too loose, MIP does the real work, and ReLU (kFSB) splitting is
-    /// the correct BaB fallback. Input splitting is hopeless on these nets.
+    /// MIP-complete mode selects kFSB ReLU splitting.
     MipComplete,
-    /// The network input is low-dimensional, so input splitting tightens the
-    /// input box directly and beats ReLU splitting.
+    /// Input count meets the low-dimensional rule; select input splitting.
     LowDimInput,
-    /// The network input is moderate-dimensional but the net is structurally
-    /// small/shallow (few params AND few ReLU nodes), so the unstable-neuron
-    /// frontier is small and input splitting still converges. This is the
-    /// "dist_shift class": a small conv/FC autoencoder over a ~hundreds-element
-    /// input.
+    /// Moderate inputs, parameters and ReLU nodes meet their caps; select input splitting.
     SmallShallowNet,
-    /// The network input is high-dimensional (image / FC / transformer), OR the
-    /// net carries a large unstable-ReLU frontier (deep/wide conv or transformer
-    /// stack), so ReLU (kFSB) splitting is the only tractable choice.
+    /// No input-splitting rule matched; select kFSB ReLU splitting.
     HighDimOrManyRelu,
 }
 
@@ -141,16 +88,8 @@ impl AutoBranchingReason {
     }
 }
 
-/// Cheap, model-intrinsic signals available at/after model load, used to pick the
-/// branching method from the model's STRUCTURE rather than from raw input size
-/// alone.
-///
-/// All fields are derived during load (input shape, the ONNX/native layer list,
-/// and `param_count`), so gathering them costs nothing extra. The structural
-/// fields are bundled in an [`Option`] (`structure`) because the resolution can
-/// also run *before* the model is built (e.g. epsilon-ball mode peeked only the
-/// spec input count); in that pre-structure case the heuristic degrades to the
-/// dimensionality-only decision.
+/// Model metadata for branching selection. Before model construction, structure
+/// may be absent and selection uses only input count and complete-verifier mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ModelClassSignals {
     /// Flattened input element count (e.g. 5 for ACAS-Xu, 3072 for CIFAR).
@@ -167,7 +106,7 @@ pub(crate) struct ModelClassSignals {
 pub(crate) struct ModelStructure {
     /// Total parameter count (capacity / width / depth proxy).
     pub(crate) param_count: usize,
-    /// Whether the model contains Conv2d / ConvTranspose layers.
+    /// Whether the model contains Conv1d, Conv2d, ConvTranspose1d or ConvTranspose2d.
     pub(crate) has_conv: bool,
     /// Count of ReLU-family activation nodes (depth / unstable-frontier proxy).
     pub(crate) relu_node_count: usize,
@@ -190,9 +129,7 @@ impl ModelClassSignals {
 impl ModelStructure {
     /// Extract the cheap structural signals from a loaded `Network`.
     ///
-    /// All signals are read directly off the parsed layer list and the network's
-    /// `param_count`, so this is O(layers) and allocates nothing — it costs nothing
-    /// beyond a single pass over the already-loaded metadata.
+    /// Reads the layer list and `param_count` in O(layers), without allocation.
     ///
     /// `is_dag` is supplied by the caller (it derives from the graph-build pass,
     /// which detects binary/multi-input ops the flat layer list does not surface).
@@ -315,46 +252,16 @@ pub(crate) fn apply_resolved_auto_branching_runtime_policy(
     config.use_multi_objective_critical_kfsb = resolved.use_multi_objective_critical_kfsb;
 }
 
-/// Model-CLASS-aware auto-selection of the branching method.
+/// Select a branching strategy from model metadata, in this order:
 ///
-/// Picks the best sound search strategy from the model's STRUCTURE, subsuming the
-/// per-category preset routing that previously lived in `vnncomp_scripts/
-/// run_instance.sh` and in per-benchmark preset `bab.branching.method`.
+/// 1. MIP complete verifier: kFSB ReLU splitting.
+/// 2. Inputs at or below [`INPUT_SPLIT_MAX_INPUT_DIM`]: input splitting.
+/// 3. Inputs at or below [`MODERATE_INPUT_SPLIT_MAX_INPUT_DIM`], with parameters
+///    and ReLU nodes within their `MODERATE_NET_MAX_*` caps: input splitting.
+/// 4. Otherwise: kFSB ReLU splitting.
 ///
-/// Decision order (first match wins):
-///
-/// 1. **MIP complete verifier active** => [`BranchingHeuristic::Kfsb`]
-///    ([`AutoBranchingReason::MipComplete`]). On SAT-encoded / NLP / malware-Conv
-///    categories, CROWN is too loose and MIP does the real work; the BaB pass is a
-///    fallback where ReLU splitting is correct and input splitting is hopeless.
-///
-/// 2. **Low-dim input** (`input_element_count <= INPUT_SPLIT_MAX_INPUT_DIM`) =>
-///    [`BranchingHeuristic::InputSplit`] ([`AutoBranchingReason::LowDimInput`]).
-///    ACAS-Xu (5), cersyve (4), lsnc (6), nn4sys (1), TLLVerifyBench (2),
-///    linearizenn (4), cgan latent (5), sat_relu (30) all have tiny inputs and a
-///    small unstable frontier; tightening the input box directly wins.
-///
-/// 3. **Moderate-dim input over a small/shallow net** (`input_element_count <=
-///    MODERATE_INPUT_SPLIT_MAX_INPUT_DIM` AND `param_count <= MODERATE_NET_MAX_PARAMS`
-///    AND `relu_node_count <= MODERATE_NET_MAX_RELU`) =>
-///    [`BranchingHeuristic::InputSplit`] ([`AutoBranchingReason::SmallShallowNet`]).
-///    This is the dist_shift class: 792 inputs over a small conv/FC autoencoder. The
-///    net is small enough that the input box can be fanned out and the
-///    few-unstable-neuron net converges. Genuine CNNs in the same input band
-///    (collins_rul) carry far more params / ReLU nodes and fall through to rule 4.
-///    Requires the structural signals; when they are absent (pre-build) this rule is
-///    skipped and a moderate-dim input falls through to rule 4 (conservative: ReLU
-///    splitting is always sound, just possibly slower).
-///
-/// 4. **Otherwise** => [`BranchingHeuristic::Kfsb`]
-///    ([`AutoBranchingReason::HighDimOrManyRelu`]). High-dimensional image /
-///    transformer inputs (CIFAR 3072, ViT 3072, TinyImageNet 9408, traffic_signs
-///    12288, VGGNet 150528, yolo 8112) and moderate-dim-but-large nets have a huge
-///    unstable-ReLU frontier where input splitting is hopeless and ReLU (kFSB)
-///    splitting is the only tractable choice.
-///
-/// SOUNDNESS: every branching method is sound — this only selects which sound
-/// search strategy runs, never changing a verdict.
+/// Rule 3 requires loaded structural metadata. This changes search strategy,
+/// while each strategy retains its verdict checks.
 pub(crate) fn auto_select_branching(
     signals: ModelClassSignals,
 ) -> (BranchingHeuristic, AutoBranchingReason) {

@@ -43,16 +43,13 @@ default-members = [
     # Untrusted search (ENGINE_PROGRAM §1.3). A default member so a
     # workspace-root `test` runs its crate-DAG ratchet (R2).
     "crates/ny-bbe",
-    # Macos/aarch64 Accelerate seam. Already compiled on Apple silicon as a
-    # ny-cli target dependency; listed here so `cargo test` at the workspace
-    # root runs its conformance + mutation + exact-rational suites (the probe
-    # spec's "CI (not runtime)" obligation). Compiles to an inert stub with zero
-    # tests on every other target.
+    # Include Accelerate conformance tests in default workspace tests on Apple
+    # silicon; other targets compile an inert stub.
     "crates/ny-accelerate",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
@@ -67,9 +64,6 @@ dead_code = "warn"
 # tRustc sets the `trust_verify` cfg flag when contract verification is active
 # (`targo trust ... --contracts`), gating the first-class `core::contracts` import.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trust_verify)'] }
-# unreachable_pub deferred — 119+ violations in ny-propagate alone.
-# Tracked for incremental tightening as remaining pub items are pruned.
-# unreachable_pub = "warn"
 # Deny, not warn: a doubled `#[test]` usually means an item was pasted between
 # an attribute and its target, silently un-testing the function below. A warning
 # let exactly that happen once.
@@ -127,10 +121,10 @@ cast_possible_wrap = "allow"          # Same rationale
 cast_sign_loss = "allow"              # Same rationale
 cast_precision_loss = "allow"         # Same rationale
 cast_lossless = "allow"              # f32→f64 widening is intentional in bound arithmetic
-uninlined_format_args = "allow"      # Style-only, 500+ sites, not a bug risk
+uninlined_format_args = "allow"      # Style preference
 redundant_closure_for_method_calls = "allow"  # Style preference, ay also allows
 cloned_instead_of_copied = "allow"   # Style preference
-use_self = "allow"                   # Style preference, 333 sites in propagate alone
+use_self = "allow"                   # Style preference
 unreadable_literal = "allow"
 match_bool = "allow"
 inline_always = "allow"

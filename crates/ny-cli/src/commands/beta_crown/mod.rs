@@ -429,69 +429,15 @@ impl GemmEngine for SharedAttackGemmOnly {
     }
 }
 
-/// Pick the best falsification accelerator this host can actually offer.
+/// Select the attack accelerator independently of the proof backend.
 ///
-/// Attack steering is verdict-neutral by construction (`attack_steering.rs`):
-/// its floats only choose WHERE to look next, and every candidate still passes
-/// the unchanged admission gates. So it must NOT be gated on the *proof*
-/// backend — and gating it there was silently costing `sat` rows.
+/// Steering only proposes candidates; the existing CPU admission gates check
+/// every candidate. Reuse the qualified WGPU proof context when available;
+/// an explicit CPU request without an accelerator request disables steering.
 ///
-/// Historically the public quarantine changed a preset's `device: wgpu` into
-/// `Cpu`; the old rule then read that fallback as "no accelerator" and disarmed
-/// steering outright. The presets that request WGPU are exactly the
-/// falsification-heavy ones (soundnessbench, cifar100, tinyimagenet, metaroom),
-/// so the categories that most need accelerated attacks were the only ones
-/// guaranteed not to get them. Measured on soundnessbench here: 25 of 28 rows
-/// timed out with steering disarmed.
-///
-/// The public proof route now keeps the original request separate from the
-/// effective backend. A qualified WGPU device is reused for attack VJPs; a
-/// qualification refusal may use the separate verdict-neutral attack wrapper;
-/// an explicit CPU request remains fully CPU.
-///
-/// #36 RESIDUAL (NVIDIA hosts): `SharedEngine` is NOT equivalent to
-/// `WgpuDevice` for this consumer. [`SharedAttackGemmOnly`] deliberately hides
-/// every optional resident capability (correctly: the CUDA engine advertises
-/// hooks whose point-VJP methods it does not implement), so on an NVIDIA host
-/// `gemm_engine.and_then(|e| e.as_gpu_crown_backward())` is `None` and BOTH
-/// batched exact-VJP attack lanes — `graph_pgd_vjp_batched.rs:218` and
-/// `graph_pgd_vjp_batched_disj.rs:103` — statically decline. Those are exactly
-/// the lanes the wgpu presets are tuned around (metaroom's preset records the
-/// batched exact-VJP disjunctive lane finishing a 30-restart budget in
-/// 0.4s/3.6s and converting spec_idx_129/148 from timeout to sat). The
-/// `AttackSteeringDevice` (WGPU) route DOES carry that hook, and this host has
-/// a working adapter (NVIDIA GB10, IntegratedGpu, Vulkan).
-///
-/// The "redundant Vulkan graphics context costs more than it buys" rationale
-/// predates #wallhugger-arming-cost (A6): arming now happens on a detached
-/// background thread, so the context cost is off the critical path.
-///
-/// #36 RESIDUAL RESOLVED (2026-08-03): the residual is now MEASURED, and the
-/// default moves to the capability-bearing route on NVIDIA hosts too.
-/// soundnessbench model_0 at the official 150 s budget, same binary, same
-/// preset, serial:
-///
-/// * `SharedEngine` → exact-VJP lane declines → sequential loop reaches
-///   restart 0 / step 8 of the 121 s slice → **timeout at 145.4 s**;
-/// * `WgpuDevice` → batched exact-VJP wave, K=64 at ~69 ms/step (1.1 ms per
-///   restart-step) → **sat at 38.2 s** (wave restart 51, step 555).
-///
-/// #attack-steering-segv RESOLVED (2026-08-03): that route used to fault, and
-/// this function used to answer `SharedEngine` unless a `NY_ATTACK_STEERING_WGPU=1`
-/// opt-in. The fault was never in `WgpuDevice::new` — 12 of 12 gdb-captured
-/// faults showed the MAIN thread inside `exit` → `_dl_fini` → `_dl_call_fini`
-/// running libGLX_nvidia's destructors while the detached `ny-attack-arming`
-/// thread was still building the device. Fast rows were the exposed class
-/// because they publish a verdict inside the ~360 ms arming window. The scored
-/// path now ends with `_exit` once the verdict is durable
-/// (`exit_scored_instance_without_teardown`), which makes that race unreachable
-/// — see that function for the captured stacks and the re-measured rate.
-///
-/// `NY_ATTACK_STEERING_WGPU=0` opts OUT (A/B and emergency lever); anything
-/// else, including unset, takes the capability-bearing route.
-/// The separate attack wrapper remains verdict-neutral and advertises no proof
-/// authority. The `ProofDevice` arm is different: it reuses the already
-/// qualified verdict context instead of constructing any wrapper.
+/// On probe-skipped hosts, `NY_ATTACK_STEERING_WGPU=0` selects the shared
+/// GEMM-only engine, which lacks resident point-VJP capabilities. Otherwise
+/// use the separate WGPU attack wrapper, which carries no proof authority.
 fn attack_steering_route(
     requested_backend: BackendArg,
     qualified_wgpu_proof_active: bool,
@@ -506,22 +452,16 @@ fn attack_steering_route(
         return AttackSteeringRoute::Disabled;
     }
     if wgpu_probe_skipped && attack_steering_wgpu_opt_out() {
-        // Explicit opt-out on a probe-skipped host: reuse the process-global
-        // CUDA engine instead of opening a second graphics context. Costs the
-        // exact-VJP lanes (soundnessbench falls back to 1/50), so this exists
-        // for A/B measurement, not for scoring.
+        // Explicit opt-out on a probe-skipped host: reuse the shared GEMM-only
+        // engine, without resident point-VJP capabilities.
         AttackSteeringRoute::SharedEngine
     } else {
         AttackSteeringRoute::WgpuDevice
     }
 }
 
-/// Opt-OUT lever for the #36 residual (see [`attack_steering_route`]).
-/// `NY_ATTACK_STEERING_WGPU=0` keeps the shared engine on a host whose adapter
-/// probe was skipped; anything else (including unset) takes the WGPU route.
-///
-/// Exact-literal `0` only: a malformed or non-Unicode value must not silently
-/// disarm the accelerator on a scored run.
+/// Recognize the shared-engine opt-out used by [`attack_steering_route`].
+/// Only the literal `0` matches; unset, malformed and non-Unicode values do not.
 pub(crate) fn attack_steering_wgpu_opt_out() -> bool {
     std::env::var("NY_ATTACK_STEERING_WGPU").ok().as_deref() == Some("0")
 }
@@ -2190,22 +2130,10 @@ pub(crate) fn handle_beta_crown_command(
     // NLP / malware nets).
     let mip_complete_verifier = complete_verifier == CompleteVerifierArg::Mip;
 
-    // Model-CLASS-aware auto-branching is resolved INSIDE `load_model`, once the
-    // network's structural signals (param_count, conv presence, ReLU-node count)
-    // and the DAG flag are known — pure input dimensionality cannot separate the
-    // dist_shift class (792-dim small conv autoencoder → input split) from
-    // collins_rul (400-dim CNN → ReLU split). We build the request whenever the
-    // user did not PIN an explicit branching method and no preset owns it; this
-    // covers both `--branching auto` (the clap default the `beta-crown` CLI gets)
-    // AND `branching == None` (what the `ny vnncomp` entry point passes directly to
-    // the handler). Gating on `!cli_branching_provided` rather than `cli_branching_auto`
-    // is the difference: `is_auto_branching(None)` is false, so the old
-    // `cli_branching_auto` gate silently DROPPED auto-selection for the entire
-    // `ny vnncomp` path — every DAG model (ResNet/ViT: tinyimagenet, cifar100,
-    // vggnet, …) then hit the "Model is a DAG" bail and scored `unknown`, even
-    // though the `beta-crown` CLI handled them fine. `load_model` returns the
-    // resolved decision. The spec-peeked input count is passed only as a fallback
-    // for the model `input_dim`. SOUND: the branching choice never changes a verdict.
+    // Let `load_model` choose from structural signals when neither the CLI
+    // nor the preset pins branching. This includes the harness's `None`, as
+    // well as the `beta-crown` CLI's `auto`. Input dimension alone cannot
+    // distinguish model classes; the spec's input count is only a fallback.
     let mut auto_input_split_selected = false;
     let auto_request = (!cli_branching_provided && !preset_owns_branching).then_some(
         branching::AutoBranchingRequest {
@@ -2702,17 +2630,10 @@ pub(crate) fn handle_beta_crown_command(
     } else if auto_input_split_selected
         && config.max_domains == BetaCrownConfig::default().max_domains
     {
-        // Companion setting for auto-selected input splitting: input splitting fans
-        // the input box into many subdomains and needs a larger frontier than the
-        // ReLU-split default. Mirrors the `--max-domains 50000` the VNN-COMP runner
-        // applied for input-split categories. Only applied when neither the CLI nor
-        // a preset pinned max_domains. #ruarobot-clobber: the old assumption that
-        // "a preset that set max_domains also set branching, so auto never fires"
-        // is FALSE (safenlp_2024.yaml pins max_domains=4000 without a branching
-        // method); raising the cap here clobbered the preset's load-bearing budget
-        // split and starved the MIP escalation below its floor. The default-value
-        // comparison detects a preset pin (same resolver pattern as the comment
-        // above). SOUND: a domain cap only bounds search effort, never a verdict.
+        // Raise the default-valued cap after auto selects input splitting.
+        // Explicit CLI values and nondefault preset values are retained. The
+        // comparison tests the resolved value, so a preset explicitly setting
+        // that same default also meets this condition.
         config.max_domains = config
             .max_domains
             .max(branching::AUTO_INPUT_SPLIT_MAX_DOMAINS);
@@ -2851,15 +2772,8 @@ pub(crate) fn handle_beta_crown_command(
     if let Some(v) = alpha_skip_depth {
         config.alpha_config.adaptive_skip_depth_threshold = v;
     }
-    // Intermediate-bounds mode: CLI-only override. `--crown-ibp-intermediates`
-    // is a bare flag, so `false` cannot be distinguished from "not passed" —
-    // assigning unconditionally therefore CLOBBERED whatever
-    // `solver/bab.alpha_crown.fix_interm_bounds` a preset had just applied,
-    // which is why the `ny vnncomp` path (which passes `false` positionally)
-    // could never reach the tighter CROWN-IBP-intermediate mode. Applying it
-    // only when the flag was actually passed keeps `--crown-ibp-intermediates`
-    // winning over the preset and leaves preset-free runs byte-identical
-    // (`AlphaCrownConfig::default().fix_interm_bounds == true`).
+    // An explicit flag enables CROWN-IBP intermediates; absence preserves the
+    // preset's fix_interm_bounds policy.
     if crown_ibp_intermediates {
         config.alpha_config.fix_interm_bounds = false;
     }

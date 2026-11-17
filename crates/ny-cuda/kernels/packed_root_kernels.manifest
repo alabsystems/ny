@@ -1,0 +1,12 @@
+format=1
+entry=packed_root_conv_ordered
+abi=seven-pointers-six-u32-two-u64
+source_sha256=b3f24e1816551128bfcb33718475e96f3a3a5c987c9b90bf11e959442abc3d1d
+fixtures_sha256=91eb3d743bd7903d26880d8e54ba1399370ba549b50968748ee93aac8dcea996
+compiler=NVRTC 13.0
+flags=--std=c++17 --fmad=false --ftz=false --prec-div=true --prec-sqrt=true
+runtime_compilation=false
+ptx_fallback=false
+sm_86_sha256=3b06cbe2a1f8c7726eebf0c4f10511b710f33bf58a501388177f6db33ef317b8
+sm_120_sha256=dba2dc349fa117b135431081bb5434041dba1a84f1c077cd8e0a452ec1ac5406
+sm_121_sha256=daf3dbfd51564379b38edc481d8403cc6fe54d53706fc934f73edbc7282e5966

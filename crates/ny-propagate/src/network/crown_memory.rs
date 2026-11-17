@@ -208,8 +208,8 @@ const LIVE_MEMORY_PROBE_TTL: Duration = Duration::from_secs(1);
 /// Get the sequential CPU Dense-materialization budget in bytes.
 ///
 /// Priority: `NY_DENSE_BUDGET_MB` env var > host-adaptive share > 2 GiB floor,
-/// then the live cgroup/RLIMIT envelope clamps every path.  An operator value
-/// overrides a heuristic; it cannot override a limit the kernel will enforce.
+/// then observed cgroup, RLIMIT and system headroom clamp every path. An
+/// operator value cannot bypass that clamp or the per-thread fan-out share.
 pub fn cpu_crown_dense_budget_bytes() -> usize {
     // #poll-amortise: ONE observation of the memory terms, used for both the
     // adaptive policy and the process-envelope clamp. This function used to
@@ -1339,8 +1339,8 @@ pub(crate) fn explicit_cpu_crown_dense_budget_bytes() -> Option<usize> {
 /// - the process soft `RLIMIT_AS`, installed by `ny-safe-gpu-run` via
 ///   `ulimit -v`, less the process's current `VmSize`.
 ///
-/// ...and, since #mem-governor, a third SELF-GOVERNING term for the case those
-/// two do not cover, which is the case competition actually runs in:
+/// A system-availability term also applies, including when no kernel limit
+/// was installed by the harness:
 ///
 /// - [`system_memory_headroom_from`], derived from `/proc/meminfo`
 ///   `MemAvailable` and this process's own `/proc/self/status` `VmRSS`.

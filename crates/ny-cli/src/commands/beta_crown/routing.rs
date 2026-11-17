@@ -7,30 +7,17 @@
 use super::super::backend::{apply_preset_device, BackendRequest, BackendRequestSource};
 use crate::{BackendArg, CompleteVerifierArg};
 
-/// Input element-count threshold (in scalars) above which the GPU is preferred by
-/// the auto-backend default.
-///
-/// Measured on real Metal hardware: the wgpu backend accelerates the large conv
-/// GEMMs in image/large-net models (cifar100=3072, traffic_signs=12288,
-/// tinyimagenet=9408, yolo=8112, vit=3072, vggnet16=150528 input elements) but
-/// HURTS small / low-dimensional models, where the serialized GPU op lock costs
-/// more than the highly-parallel CPU input-split BaB saves (acasxu=5, cersyve=4,
-/// sat_relu=30, collins_rul=400 input elements → CPU). A strict `> 1000` split
-/// cleanly separates these two regimes.
+/// Input element-count threshold above which AUTO may request wgpu.
 pub(crate) const AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS: usize = 1000;
 
 /// Pure auto-backend default decision used when neither an explicit `--backend`,
 /// the legacy `--gpu` flag, nor a preset `general.device` selected a backend.
 ///
-/// Chooses wgpu (GPU) when the model input is LARGE (`input_element_count`
-/// strictly greater than [`AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS`]) AND a GPU
-/// backend is available; otherwise CPU.
-///
-/// SOUNDNESS: the backend is numerically faithful (CPU and GPU produce the same
-/// verified/unsat/sat verdict), so this is purely a speed choice and can never
-/// change a verdict. When the input size is unknown (e.g. epsilon-ball mode with
-/// no VNN-LIB spec) we conservatively prefer CPU, which is always available and
-/// never worse for the small/low-dim nets that lack a spec to size.
+/// Requests wgpu when the input count exceeds
+/// [`AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS`] and the supplied GPU capability hint
+/// is enabled; otherwise CPU, including when the input count is unknown. Device
+/// creation and proof qualification happen later. This size heuristic does not
+/// establish hardware availability, numerical qualification, or a speed improvement.
 #[must_use]
 pub(super) fn auto_backend_default(
     input_element_count: Option<usize>,
@@ -39,15 +26,15 @@ pub(super) fn auto_backend_default(
     match input_element_count {
         Some(count) if count > AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS && gpu_available => (
             BackendArg::Wgpu,
-            "large input (>1000 elements): conv GEMMs dominate, GPU faster",
+            "large input (>1000 elements), GPU capability hint enabled: requesting wgpu",
         ),
         Some(count) if count > AUTO_BACKEND_GPU_MIN_INPUT_ELEMENTS => (
             BackendArg::Cpu,
-            "large input but no GPU available: using CPU",
+            "large input (>1000 elements), GPU capability hint disabled: using CPU",
         ),
         Some(_) => (
             BackendArg::Cpu,
-            "small/low-dim input (<=1000 elements): CPU input-split BaB faster",
+            "input count <=1000 elements: automatic backend default selects CPU",
         ),
         None => (
             BackendArg::Cpu,
@@ -62,14 +49,15 @@ pub(super) fn auto_backend_default(
 /// 1. explicit `--backend cpu|wgpu`
 /// 2. legacy `--gpu` flag (→ wgpu)
 /// 3. preset `general.device`
-/// 4. AUTO default: GPU for large inputs when available, else CPU
+/// 4. AUTO default: request wgpu for large inputs when the capability hint is enabled
 ///    (see [`auto_backend_default`]).
 ///
 /// `input_element_count` is the VNN-LIB spec's flattened input element count
 /// (reused from the pre-load property input summary); `None`
-/// when no spec is present. `gpu_available` reports whether the wgpu backend is
-/// compiled in. A wgpu choice that fails to initialize a device at runtime still
-/// falls back to CPU at device-creation time, so this resolution never aborts.
+/// when no spec is present. The direct CLI defaults `gpu_available` to compiled
+/// wgpu support; VNN-COMP supplies its runtime accelerator hint, including an
+/// explicit `GPU_AVAILABLE` override. Runtime backend resolution handles device
+/// initialization, qualification, and CPU fallback separately.
 #[cfg(test)]
 pub(super) fn resolve_beta_crown_backend(
     backend: Option<BackendArg>,

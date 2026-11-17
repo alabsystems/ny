@@ -27,7 +27,7 @@ ny-levers = { path = "../ny-levers" }
 # ay-milp is the in-process MILP/LP backend, rev-pinned to a commit SHA
 # (never a floating branch); see docs/SOLVER_POLICY.md. Engine-dependent lanes
 # must verify that the revision contains the features their budget model uses.
-ay-milp = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724" }
+ay-milp = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9" }
 num-bigint.workspace = true
 num-rational = "0.4"
 num-traits = "0.2"

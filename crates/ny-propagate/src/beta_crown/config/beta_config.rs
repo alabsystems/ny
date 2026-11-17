@@ -102,10 +102,9 @@ pub struct BetaCrownConfig {
     /// row sidecar is fully censused.
     ///
     /// When the resident queue exceeds the cap, the lowest-priority (least
-    /// promising) domains are discarded. Evicted domains are unexplored and
-    /// unverified, so the run is forced to `Unknown` rather than `Verified`
-    /// (`GraphBabLifecycle::unresolved_due_to_eviction`); no bound is ever
-    /// widened, so the result stays sound.
+    /// promising) domains are discarded. The completeness latch prevents a
+    /// drained queue from yielding `Verified`; a concrete counterexample can
+    /// still refute the property. Surviving bounds are unchanged.
     ///
     /// `0` disables the cap and is the default, preserving uncapped queue
     /// semantics. A queue retains at least one domain for forward progress, so
@@ -284,23 +283,11 @@ pub struct BetaCrownConfig {
     /// properties. Reference: alpha-beta-CROWN `optimize_disjuncts_separately`.
     #[serde(default)]
     pub optimize_disjuncts_separately: bool,
-    /// Hard wall-clock cap (seconds) on the ROOT alpha-CROWN warmup, including
-    /// the intermediate-bound collection that runs inside it.
-    ///
-    /// `None` (default) leaves the warmup bounded only by the phase budget,
-    /// which is what it did historically: on a deep conv DAG it then expands to
-    /// consume essentially the whole initial-bounds slice and BaB inherits
-    /// whatever is left. That is a bad trade when the root bound is already
-    /// good enough to close: measured on cifar100_2024
-    /// CIFAR100_resnet_medium_prop_idx_9694 at the OFFICIAL 100s budget, the
-    /// margin-row BaB needs ~26s to reach UNSAT, and it only gets that if the
-    /// root is capped. Capped root (40s) + a reclaimed disjunctive-PGD slice
-    /// turns that instance from `timeout` into `unsat` at 100s; NEITHER change
-    /// alone is sufficient (both measured `timeout` in isolation).
-    ///
-    /// Deadlines only schedule work — every path falls back to sound reference
-    /// bounds on expiry — so this knob carries no soundness obligation.
-    /// `NY_ROOT_ALPHA_CAP_SECS` still overrides it.
+    /// Optional scheduling cap in seconds for the root alpha-CROWN warmup,
+    /// including its intermediate-bound collection. It only narrows the
+    /// existing deadline; expiry preserves the route's certified fallback or
+    /// refusal behavior.
+    /// A positive finite `NY_ROOT_ALPHA_CAP_SECS` overrides this setting.
     #[serde(default)]
     pub root_alpha_cap_secs: Option<f64>,
     /// Retain a completed, certified DAG-alpha artifact when the root warmup's
@@ -324,10 +311,8 @@ pub struct BetaCrownConfig {
     /// [`ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS`] whole-`C` proposals may run.
     #[serde(default)]
     pub atomic_root_c_margin_iterations: usize,
-    /// Use CROWN-IBP for tighter intermediate bounds.
-    /// When enabled, intermediate bounds are computed using CROWN backward
-    /// propagation and intersected with IBP bounds, producing ~66% tighter bounds
-    /// than standard CROWN. More expensive but significantly improves verification.
+    /// Intersect CROWN backward intermediate bounds with IBP bounds on supported
+    /// routes, at additional time and memory cost.
     #[serde(default)]
     pub use_crown_ibp: bool,
     /// Frozen runtime decision for objective-chunk parallel waves.

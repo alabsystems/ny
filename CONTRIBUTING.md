@@ -7,9 +7,11 @@ targo --unverified build --locked --release -p ny-cli    # → target/release/ny
 ```
 
 Every build names a Trust lane. `targo --unverified` builds and tests without
-a compiler proof. `targo trust check --allow-l0-gaps` runs the advisory
-verification lane used by the release gate; unknown obligations are conditional
-passes, not discharged proofs. A bare `targo build` is refused.
+a compiler proof. `targo trust check --allow-l0-gaps` runs advisory
+verification; unknown obligations are conditional passes, not discharged proofs.
+A bare `targo build` is refused. The current release gate runs an unverified
+workspace build and the 19-test relaxation-envelope floor; it makes no compiler
+proof claim.
 
 ### If targo is not on PATH
 
@@ -28,9 +30,10 @@ backstop`, update the managed Trust installation.
 The competition builder, `scripts/vnncomp_trust_linux_build.sh`, requires
 Ubuntu 24.04 x86_64 and enables `--features mip,cuda`.
 Ordinary Linux builds also need a compatible ONNX Runtime: the prebuilt library
-requires Ubuntu 24.04 or newer. On older systems, use a 24.04 container or set
-`ORT_LIB_LOCATION` to a locally built runtime. `install_tool.sh` can fall back
-to a source build, which still requires Trust.
+for GNU/Linux x86_64 requires glibc 2.39 or newer, as shipped by Ubuntu 24.04.
+On older systems, use a 24.04 container or set `ORT_LIB_LOCATION` to a locally
+built runtime. `install_tool.sh` can fall back to a source build, which still
+requires Trust.
 
 **Build measured binaries with `--features mip`.** Without it, both BNN
 falsification lanes are disabled. Confirm `mip_compiled=true` in the
@@ -51,8 +54,13 @@ python -m pip install maturin
 make PYTHON="$VIRTUAL_ENV/bin/python" test-python
 ```
 
-Tests may not be ignored or skipped (`#[ignore]`, `pytest.skip`, and similar);
-a source-policy test enforces this.
+Workspace tests include GPU controls enabled by `ny-cli`'s dev dependencies and
+need a suitable adapter. See `TEST_CONFORMANCE.md` for
+individual device, corpus and checker lanes.
+
+Tests may not use ignore or skip directives (`#[ignore]`, `pytest.skip`, and
+similar); a source-policy test enforces this. Optional-corpus controls that
+return early without assets provide no execution evidence.
 
 ## Lint
 

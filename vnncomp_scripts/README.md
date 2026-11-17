@@ -64,7 +64,8 @@ source commit. When the sealed triplet above is absent, `install_tool.sh`
 installs this artifact. It first runs `verify_release.py`, then requires the
 binary to report MANIFEST's exact `--build-id` and `--build-stamp`, then requires
 correct answers on both `selftest/` instances, and then binds a `release`
-receipt. Any failure refuses the install without a source-build fallback.
+receipt. Verification, identity and self-test failures refuse the install.
+An older or undetected glibc instead falls back to a source build.
 `MANIFEST` also records `ny_commit`'s tree id and its raw commit object, which
 must hash to `ny_commit` and name that tree. The verifier and the receipt bind
 the checkout by content: `HEAD`'s tree, minus exactly the release files, must

@@ -1,0 +1,33 @@
+{
+  "architectures": [
+    86,
+    120,
+    121
+  ],
+  "builder_sha256": "a5af7f504c4e677fa0c89dfae46636650cd18bbbbe902ddf683cbdcd38fb0328",
+  "compiler_files": {
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc-builtins.alt.so.13.0": "1c26e0ff9a9eecdf1faae6a10f036b50641b1da8964e137001efc18b85e19d66",
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc-builtins.so.13.0": "91dcd944d01da9c0f08fff5d779db136a47f6d62bdb63bae900d2f481e92c3a2",
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc.alt.so.13": "c1e3f9b5194970fb1de865620a67a5c7e7ea199425df8df5963bd883f843acb6",
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc.so.13": "a49e67e8e74590f1e98de55c39c6287efd3f59e3c3797464d7bbe0fe01349b11"
+  },
+  "compiler_logs": {
+    "120": "",
+    "121": "",
+    "86": ""
+  },
+  "fixture_sha256": "91eb3d743bd7903d26880d8e54ba1399370ba549b50968748ee93aac8dcea996",
+  "flags": [
+    "--std=c++17",
+    "--fmad=false",
+    "--ftz=false",
+    "--prec-div=true",
+    "--prec-sqrt=true"
+  ],
+  "loaded_compiler_files": [
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc-builtins.so.13.0",
+    "<home>/.cache/uv/archive-v0/mDndMvVYFsTcRq_k/nvidia/cu13/lib/libnvrtc.so.13"
+  ],
+  "runtime_qualification_claimed": false,
+  "source_sha256": "b3f24e1816551128bfcb33718475e96f3a3a5c987c9b90bf11e959442abc3d1d"
+}

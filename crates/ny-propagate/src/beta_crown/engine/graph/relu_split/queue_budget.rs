@@ -2,56 +2,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Memory budget for the graph ReLU-split branch-and-bound domain queue
-//! (#ml4acopf-bab-queue-mem).
+//! Estimated payload budget for graph ReLU-split branch-and-bound queues
+//! (#ml4acopf-bab-queue-mem), shared by ordinary and precomputed-bounds routes.
 //!
-//! # The defect
+//! When `max_queue_bytes` is exceeded, retain the highest-priority prefix down
+//! to a low-water mark. Always keep one domain, even if it alone exceeds the
+//! budget. The ordinary loop targets a fraction of that budget for each popped
+//! wave, again admitting at least one domain. These estimates do not cap total
+//! process memory.
 //!
-//! `bab_loop.rs` keeps its frontier in a `BinaryHeap<GraphBabDomain>` with no
-//! size and no memory cap. Every queued `GraphBabDomain` owns a full copy of
-//! the per-node bounds map plus its per-neuron α state, so one domain costs
-//! `8 * Σ node elements + 32 * unstable α neurons` bytes — measured at 1.37 MB
-//! on `ml4acopf_2024` `118_ieee_ml4acopf-linear-residual`. The only limits that
-//! exist are COUNT based: `max_domains = 100_000` (checked once per wave) and
-//! `max_queue_size = 500_000` (which only `DomainList` consults, not this
-//! heap). 100,000 × 1.37 MB = 137 GB, so on that model the host OOM-killer
-//! arrives first: measured 116.3 GiB RSS at 81,920 resident domains, `rc=137`,
-//! with the queue itself accounting for 96% of the footprint.
-//!
-//! # The bound
-//!
-//! `GraphBabQueueBudget` caps the summed `estimate_graph_domain_bytes` of the
-//! resident queue at `BetaCrownConfig::max_queue_bytes`, evicting the
-//! lowest-priority (least promising) domains down to a low-water mark when the
-//! cap is exceeded, and additionally caps how many bytes one popped wave may
-//! hold outside the queue so the transient batch + children peak stays within a
-//! small multiple of the budget.
-//!
-//! # Soundness
-//!
-//! Eviction never changes a bound. It only changes WHICH unexplored sub-boxes
-//! get expanded, and every evicted domain is by construction unverified. The
-//! caller therefore sets `GraphBabLifecycle::unresolved_due_to_eviction`, which
-//! makes `has_unresolved()` true and forces `build_final_result()` to report
-//! `Unknown` instead of `Verified` for the rest of the run. The bounds carried
-//! by the surviving domains are the same bounds the unbounded loop would have
-//! carried, so nothing is ever looser than the intermediate bounds the domain
-//! already held; the cost is completeness only.
-//!
-//! # Gate
-//!
-//! `max_queue_bytes == 0` means unlimited and is the default: `enforce` returns
-//! `None` without touching the queue and `wave_bytes()` returns `None`, so the
-//! BaB loop runs its original code path with one `usize` comparison added per
-//! wave and per pop. Categories that do not set the key are byte-identical.
-//!
-//! # Scope
-//!
-//! Both graph ReLU-split `BinaryHeap<GraphBabDomain>` routes use this budget:
-//! the ordinary `relu_split::bab_loop` and the precomputed-bounds entry point in
-//! `relu_split_bounds.rs`. Keeping the estimator, eviction ordering, and
-//! lifecycle latch shared prevents the two structurally identical frontiers
-//! from drifting apart.
+//! Eviction discards unexplored domains without changing surviving bounds.
+//! The caller latches `unresolved_due_to_eviction`, preventing `Verified` when
+//! the queue drains; a later concrete counterexample can still refute the spec.
+//! Zero (the default) disables budgeting without traversing the queue.
 
 use std::collections::BinaryHeap;
 
@@ -60,10 +23,8 @@ use crate::beta_crown::domain::GraphBabDomain;
 use crate::beta_crown::engine::graph::adaptive_microbatch::estimate_graph_domain_bytes;
 use crate::beta_crown::engine::graph::shared::state::GraphBabLifecycle;
 
-/// A popped wave may hold at most `1 / WAVE_BYTE_SHARE_DEN` of the queue budget
-/// outside the queue. The wave's children (2 per parent) are materialized while
-/// the parents are still alive, so the transient peak is bounded by
-/// `budget + 3 * budget / WAVE_BYTE_SHARE_DEN` = 1.75x the budget at 4.
+/// Popped-wave target: `1 / WAVE_BYTE_SHARE_DEN` of the queue's payload budget.
+/// The caller always admits its first domain, even if that exceeds the target.
 const WAVE_BYTE_SHARE_DEN: usize = 4;
 
 /// After an eviction the queue is left at `EVICT_LOW_WATER_NUM /
@@ -88,7 +49,7 @@ pub(crate) struct QueueEviction {
 /// Byte budget for the resident graph ReLU-split BaB queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraphBabQueueBudget {
-    /// Cap in bytes on the resident queue. `0` disables the budget entirely.
+    /// Estimated resident payload cap; one domain may exceed it. `0` disables it.
     queue_bytes: usize,
 }
 
@@ -113,10 +74,8 @@ impl GraphBabQueueBudget {
 
     /// Byte ceiling for one popped wave, or `None` when unlimited.
     ///
-    /// The popped batch lives OUTSIDE the heap, so the queue cap alone does not
-    /// bound it: a 8,192-domain wave of 1.37 MB domains is 11 GB on its own.
-    /// Always at least one domain is admitted regardless (the caller guarantees
-    /// forward progress by never refusing the first pop).
+    /// Popped domains live outside the heap. The caller always admits the first
+    /// domain for forward progress, even if it exceeds this estimate.
     pub(crate) fn wave_bytes(self) -> Option<usize> {
         if self.is_unlimited() {
             None
@@ -128,7 +87,7 @@ impl GraphBabQueueBudget {
     /// Enforce the byte cap on `queue`, evicting the lowest-priority domains.
     ///
     /// Returns `None` when the budget is disabled — the queue is not even
-    /// traversed in that case. Otherwise returns the measured before/after
+    /// traversed in that case. Otherwise returns estimated before/after payload
     /// sizes and the number of domains discarded.
     ///
     /// Domains are kept in the queue's own pop order (highest priority first),

@@ -797,6 +797,46 @@ pub(super) fn run_mip_only(ctx: &DispatchContext<'_>, mip_solver: MipSolverArg) 
     )
 }
 
+/// The early graph verdict needs certified bounds from this complete source
+/// and input. Plain graph IBP is an ordinary f32 forward and is not a proof.
+fn early_graph_ibp_output(
+    graph: &ny_propagate::GraphNetwork,
+    input: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> ny_core::Result<BoundedTensor> {
+    let mut bounds = graph.collect_node_bounds_with_engine_and_deadline(input, None, deadline)?;
+    let output = bounds.remove(graph.output_name()).ok_or_else(|| {
+        ny_core::NyError::InvalidSpec("early certified graph IBP has no completed output".into())
+    })?;
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(ny_core::NyError::DeadlineExceeded(
+            "early certified graph IBP expired before output publication".into(),
+        ));
+    }
+    Ok(output)
+}
+
+fn early_sequential_ibp_output(
+    network: &ny_propagate::Network,
+    input: &BoundedTensor,
+    deadline: Option<Instant>,
+) -> ny_core::Result<BoundedTensor> {
+    let output = network
+        .collect_ibp_bounds_with_deadline(input, deadline)?
+        .pop()
+        .ok_or_else(|| {
+            ny_core::NyError::InvalidSpec(
+                "early certified sequential IBP has no completed output".into(),
+            )
+        })?;
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(ny_core::NyError::DeadlineExceeded(
+            "early certified sequential IBP expired before output publication".into(),
+        ));
+    }
+    Ok(output)
+}
+
 /// Run the BaB path, then optionally fall back to MIP if the result is inconclusive.
 pub(super) fn run_bab_with_fallback(
     ctx: &mut DispatchContext<'_>,
@@ -878,8 +918,12 @@ pub(super) fn run_bab_with_fallback(
     let internal_authority_deadline = bab_ledger.overall_deadline();
     if let Some(vnnlib) = ctx.vnnlib_spec {
         let ibp_result = match &*ctx.model_net {
-            BetaCrownModel::Sequential(network) => network.propagate_ibp(ctx.input),
-            BetaCrownModel::Graph(graph) => graph.propagate_ibp(ctx.input),
+            BetaCrownModel::Sequential(network) => {
+                early_sequential_ibp_output(network, ctx.input, internal_authority_deadline)
+            }
+            BetaCrownModel::Graph(graph) => {
+                early_graph_ibp_output(graph, ctx.input, internal_authority_deadline)
+            }
         };
         if let Ok(ibp_bounds) = ibp_result {
             let ibp_lower = ibp_bounds.lower().as_slice().unwrap_or(&[]);
@@ -1656,6 +1700,10 @@ pub(super) fn run_bab_with_fallback(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "dispatch_graph_ibp_tests.rs"]
+mod graph_ibp_tests;
 
 #[cfg(test)]
 mod deadline_error_tests {

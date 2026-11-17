@@ -20,6 +20,11 @@ use super::net::{nominal_product_dust, TwinNet};
 use super::root::{gates_from_box, repair_upper_lines, RetainedLayer, RootGates};
 use super::rounding::{certify_up, gamma_n, next_down, next_up, slack16, RoundMode, UNIT};
 
+#[path = "bounds_confirm.rs"]
+mod confirm;
+#[path = "bounds_tiled.rs"]
+mod tiled;
+
 /// Margin rows `m_r = Y_t - Y_{adv[r]}` split into positive/negative parts.
 pub struct MarginBatch {
     /// True class.
@@ -396,16 +401,45 @@ pub fn compose_viay(
     au_dots: &RowDots,
     mode: RoundMode,
 ) -> Vec<f64> {
+    // Exact-zero coefficients can legitimately avoid every confirmation.
+    // Qualify this outward bound itself; incidental repair is not an FP gate.
+    // The root caller rejects nonfinite lanes before combining proof bounds.
+    if mode.outward() && ny_core::require_f64_interval_proof_environment().is_err() {
+        return vec![f64::NAN; mb.nf()];
+    }
+    compose_viay_impl::<true, true>(eng, mb, gates, al, au, al_dots, au_dots, mode)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_viay_impl<const TILED: bool, const EXACT_ZERO: bool>(
+    eng: &BackwardEngine<'_>,
+    mb: &MarginBatch,
+    gates: &HeadGates,
+    al: &PassOut,
+    au: &PassOut,
+    al_dots: &RowDots,
+    au_dots: &RowDots,
+    mode: RoundMode,
+) -> Vec<f64> {
     let nf = mb.nf();
     let n_y = mb.n_y;
     let root = eng.root;
     let n_in = root.mid.len();
     let asl = al.a.as_slice().expect("standard layout");
     let usl = au.a.as_slice().expect("standard layout");
+    let tiled = (TILED
+        && (!mode.outward() || ny_core::require_f64_interval_proof_environment().is_ok()))
+    .then(|| tiled::TiledHeadRows::for_composition(asl, usl, n_in, n_y, nf))
+    .flatten();
     let gam_row = gamma_n(2 * n_y + 8);
     let gam_con = gamma_n(n_in + 16);
     let mut out = vec![0.0; nf];
     let mut rowbuf = vec![0.0; n_in];
+    // Invocation-local immutable sources; build only when repair is needed.
+    // Both flags false retain the complete original calculation for controls.
+    let mut confirmation_cache = None;
+    let mut tried_confirmation_cache = false;
+    let mut confirmation_trace = confirm::Trace::new(n_in, n_y, nf);
     for r0 in 0..nf {
         let wp = &mb.wp[r0 * n_y..(r0 + 1) * n_y];
         let wn = &mb.wn[r0 * n_y..(r0 + 1) * n_y];
@@ -421,17 +455,26 @@ pub fn compose_viay(
             }
         }
         // rows_r[k] = sum_j ca[j]*Al[k][j] + cb[j]*Au[k][j]
-        for (k, rb) in rowbuf.iter_mut().enumerate() {
-            let arow = &asl[k * n_y..(k + 1) * n_y];
-            let urow = &usl[k * n_y..(k + 1) * n_y];
-            let mut acc = 0.0;
-            for j in 0..n_y {
-                acc += ca[j] * arow[j] + cb[j] * urow[j];
-                if mode.outward() {
-                    underflow |= head_underflow(ca[j], arow[j]) || head_underflow(cb[j], urow[j]);
+        let tiled_row = tiled
+            .as_ref()
+            .and_then(|rows| rows.product_underflow(&ca, &cb).map(|dust| (rows, dust)));
+        if let Some((rows, dust)) = tiled_row {
+            rows.compose(&ca, &cb, &mut rowbuf);
+            underflow |= mode.outward() && dust;
+        } else {
+            for (k, rb) in rowbuf.iter_mut().enumerate() {
+                let arow = &asl[k * n_y..(k + 1) * n_y];
+                let urow = &usl[k * n_y..(k + 1) * n_y];
+                let mut acc = 0.0;
+                for j in 0..n_y {
+                    acc += ca[j] * arow[j] + cb[j] * urow[j];
+                    if mode.outward() {
+                        underflow |=
+                            head_underflow(ca[j], arow[j]) || head_underflow(cb[j], urow[j]);
+                    }
                 }
+                *rb = acc;
             }
-            *rb = acc;
         }
         let mut bias = 0.0;
         let mut cterm = 0.0;
@@ -465,8 +508,16 @@ pub fn compose_viay(
         let mut pen = 0.0;
         let mut tmag = 0.0;
         for j in 0..n_y {
-            let ea = slack16(3.0 * UNIT * ca[j].abs());
-            let ebc = slack16(3.0 * UNIT * cb[j].abs());
+            let ea = if EXACT_ZERO {
+                head_seed_error(wp[j], gates.alpha[j], ca[j])
+            } else {
+                slack16(3.0 * UNIT * ca[j].abs())
+            };
+            let ebc = if EXACT_ZERO {
+                head_seed_error(wn[j], gates.s[j], cb[j])
+            } else {
+                slack16(3.0 * UNIT * cb[j].abs())
+            };
             underflow |= head_underflow(3.0 * UNIT, ca[j].abs())
                 || head_underflow(3.0 * UNIT, cb[j].abs())
                 || head_underflow(ca[j].abs() + ea, al_dots.err_dot[j])
@@ -491,15 +542,30 @@ pub fn compose_viay(
         out[r0] = next_down(next_down(raw - slack));
         underflow |= head_underflow(gam_row + gam_con, certify_up(tmag, 1e-13));
         if underflow {
+            if TILED && !tried_confirmation_cache {
+                tried_confirmation_cache = true;
+                confirmation_trace.event("prepare_begin", r0, false);
+                confirmation_cache = confirm::Prepared::new(root, mb, gates, al, au).ok();
+                confirmation_trace.event("prepare_end", r0, confirmation_cache.is_some());
+            }
+            let cached = confirmation_cache.is_some();
+            confirmation_trace.event("row_begin", r0, cached);
             let check = || Ok(());
-            let confirmation = HeadPoll::new(&check)
-                .and_then(|mut poll| head_confirm_viay_row(root, mb, gates, al, au, r0, &mut poll));
+            let confirmation = if let Some(prepared) = &mut confirmation_cache {
+                prepared.row(r0)
+            } else {
+                HeadPoll::new(&check).and_then(|mut poll| {
+                    head_confirm_viay_row(root, mb, gates, al, au, r0, &mut poll)
+                })
+            };
+            confirmation_trace.row_end(r0, cached, confirmation.is_ok());
             out[r0] = match confirmation {
                 Ok(directed) if directed.is_finite() => out[r0].min(directed),
                 _ => f64::NAN,
             };
         }
     }
+    confirmation_trace.finish();
     out
 }
 
@@ -944,6 +1010,23 @@ fn head_finite(x: f64) -> Result<()> {
 #[inline]
 fn head_underflow(a: f64, b: f64) -> bool {
     nominal_product_dust(a, b) != 0.0
+}
+// A finite zero operand proves this seed coefficient has exactly zero error.
+// Testing only the rounded product would erase genuine underflow (eta * 0.5).
+// Inspect bits: DAZ can make a nonzero subnormal compare equal to zero. This
+// local exemption does not qualify the surrounding arithmetic under DAZ.
+// For MarginBatch::new, a zero split weight also has original-network
+// provenance: finite binary64 differences lie on the eta lattice, so a
+// nonzero exact difference cannot round to zero under RN+gradual underflow.
+// Nonzero differences retain their existing relative-error envelope.
+#[inline]
+fn head_seed_error(a: f64, b: f64, product: f64) -> f64 {
+    let zero = |x: f64| x.to_bits() & 0x7fff_ffff_ffff_ffff == 0;
+    if a.is_finite() && b.is_finite() && (zero(a) || zero(b)) && zero(product) {
+        0.0
+    } else {
+        slack16(3.0 * UNIT * product.abs())
+    }
 }
 #[inline]
 fn head_endpoint(value: f64) -> f64 {
@@ -1586,8 +1669,8 @@ pub(super) fn compose_viay_with_checkpoint(
         let (mut pen, mut tmag) = (0.0, 0.0);
         for j in 0..n_y {
             poll.tick()?;
-            let ea = slack16(3.0 * UNIT * ca[j].abs());
-            let ebc = slack16(3.0 * UNIT * cb[j].abs());
+            let ea = head_seed_error(wp[j], gates.alpha[j], ca[j]);
+            let ebc = head_seed_error(wn[j], gates.s[j], cb[j]);
             pen += (ca[j].abs() + ea) * al_dots.err_dot[j]
                 + ea * al_dots.abs_dot[j]
                 + (cb[j].abs() + ebc) * au_dots.err_dot[j]
@@ -1736,3 +1819,7 @@ fn head_confirm_viay_row(
 #[cfg(test)]
 #[path = "bounds_cooperative_tests.rs"]
 mod cooperative_tests;
+
+#[cfg(test)]
+#[path = "bounds_zero_tests.rs"]
+mod zero_tests;

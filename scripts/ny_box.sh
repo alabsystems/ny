@@ -1,23 +1,8 @@
 #!/usr/bin/env bash
 # ny_box.sh — mutual exclusion + quiescence gate for the measurement box.
 #
-# WHY THIS EXISTS
-# ---------------
-# On 2026-08-22 four agents worked the same box concurrently. A scored 100 s
-# cifar100 closure measurement ran while another agent held `cargo build
-# --release`; 1-min loadavg was 9.62 against a documented precondition of < 3.
-#
-# That combination does not merely add noise, it manufactures a specific WRONG
-# ANSWER. cifar100's failing rows are wallclock-bound at ~1.15 s/expansion, and
-# the closure metric is a COUNT (expansions, closed domains, open-ratio). Steal
-# cores and the run does strictly less work in the same wall, so the contaminated
-# arm reports fewer expansions and fewer closures — which reads exactly like
-# "the mechanism did nothing". The campaign has already banked one vacuous null
-# on that mechanism for a different reason (it was never armed on this lane).
-# Two vacuous nulls on the same lever would retire a live mechanism for good.
-#
-# Verdict A/Bs are much more robust to this; RATE and COUNT measurements are not.
-# So the rule is not "be careful", it is "hold the lock".
+# Builds and measurements share one advisory lock. Contention changes how much
+# work a wall-limited solver can finish, so measurements also require quiescence.
 #
 # USAGE
 #   scripts/ny_box.sh measure [--budget N] -- <command...>
@@ -34,8 +19,7 @@
 #
 # The lock is advisory and process-scoped via flock(1), or the same kernel
 # flock through Python's fcntl module where the flock CLI is unavailable. It is
-# released automatically if the holder dies, so a crashed agent cannot wedge
-# the box.
+# released when the last process holding an inherited lock descriptor closes it.
 set -uo pipefail
 
 LOCK_DIR="${NY_BOX_LOCK_DIR:-/tmp/claude-1000/ny-box}"
@@ -57,16 +41,9 @@ WAIT_QUIET="${NY_BOX_WAIT_QUIET:-900}"
 # Keeping it small is what stops a never-quiescent host from starving builds.
 QUIET_GRACE="${NY_BOX_QUIET_GRACE:-120}"
 LOAD_MAX="${NY_BOX_LOAD_MAX:-3}"
-# How "busy" is judged once no builder and no ny process is live. `cpu` (the
-# default on Linux) measures busy CPU-cores DIRECTLY over a short window from
-# /proc/stat deltas (user+nice+system+irq+softirq+steal+iowait, i.e. iowait counts
-# as busy); `loadavg` is the historical 1-minute average. The 1-minute average is
-# a LAGGING proxy: after any 20-thread ny row it stays above LOAD_MAX for 2-4
-# minutes while the CPU is ~98% idle. Measured 2026-09-28: W6B's 2-12 s rows
-# started 5 minutes apart with the box idle, so ~95% of its queue time was
-# waiting for a number to decay. The process checks above are the real guard
-# against contention; the busy-core window measures the same quantity loadavg
-# approximates, without the lag. Hosts without /proc/stat fall back to loadavg.
+# After checking for live builders and ny processes, Linux measures busy cores
+# over a /proc/stat window, counting iowait and steal as busy. Other hosts fall
+# back to the one-minute load average; NY_BOX_QUIET_PROBE=loadavg selects it too.
 QUIET_PROBE="${NY_BOX_QUIET_PROBE:-cpu}"
 QUIET_WINDOW="${NY_BOX_QUIET_WINDOW:-5}"
 PROC_STAT="${NY_BOX_PROC_STAT:-/proc/stat}"   # test hook: a file (or FIFO) standing in for /proc/stat
@@ -141,44 +118,12 @@ with open(sys.argv[1], "a+b") as lock:
 PY
 }
 
-# Foreign compute = anything that competes for cores which we did not start.
-#
-# NEVER use `-f` here: it matches this very script's own command line, a
-# self-match trap that has cost this campaign three sessions (exit 144).
-#
-# But `-x ny` was ALSO wrong, and wrong in the direction that silently corrupts
-# measurements. Every agent that follows the binary-provenance rule copies
-# `target/release/ny` to a pinned name -- `ny_pin` is the one in use today --
-# precisely because a concurrent `cargo build` would otherwise swap the binary
-# mid-run-set. `-x` is an EXACT name match, so it sees none of them. Caught
-# 2026-08-24 with `ny_pin` burning 714% CPU while this gate reported the box
-# quiet and `measure` proceeded. The careful agents were exactly the invisible
-# ones.
-#
-# Without -f, pgrep matches the pattern as a regex against the process NAME
-# only, so `^ny` catches ny/ny_pin/ny-anything and cannot match this script
-# (whose comm is `bash`).
+# Match process names, including pinned ny copies. `-x ny` misses those copies;
+# `-f` can match this script's own arguments and refuse its measurement.
 ny_procs() { pgrep '^ny' 2>/dev/null | wc -l; }
 
-# Name the offender, not just the category. A `measure` caller holds the lock
-# while it waits here, so a BARE `cargo` (one not itself taking this lock) can
-# burn the caller's whole quiescence allowance and force an exit 75 — the box
-# stays locked and idle for 15 minutes and nothing is measured. That livelock
-# was observed 2026-08-24. The waiting agent cannot fix it without knowing WHICH
-# process to chase, so print pid + command line and let it escalate.
-# BUILDER PROCESS NAMES. `rust-toolchain.toml` pins `channel = "trust"`, and every
-# build in this repo is `rustup run trust targo --unverified ...`, which spawns
-# `targo` and `trustc` -- NEVER `cargo`, NEVER `rustc`. Checking only the latter
-# two made this gate blind to every build the campaign actually runs: measured
-# 2026-09-15 at loadavg 17.58 with 20 `trustc` live, `pgrep -x cargo` and
-# `pgrep -x rustc` BOTH returned 0. The only remaining guard was the 1-minute
-# LOAD_MAX average, which lags, so a `measure` could be admitted onto a box that
-# was about to be saturated -- and wall-clock IS the verdict on wall-limited
-# benchmarks (84% of banked tinyimagenet proofs finish in the last 10% of budget).
-# The verified-lane driver (`targo-trust`) and tippy's driver (`tippy-driver`)
-# are Trust build processes too; cargo/rustc stay for any other toolchain.
-# `-x` is an EXACT name match, so each name must be listed; never `-f` (the
-# self-match trap that cost three sessions, exit 144).
+# Check Trust drivers explicitly; stock compiler names remain for other
+# toolchains. Report each matching PID and command to identify contention.
 BUILD_PROCS="targo targo-trust trustc tippy-driver cargo rustc"
 builder_pids() { local p; for p in $BUILD_PROCS; do pgrep -x "$p" 2>/dev/null; done; }
 builder_name() {
@@ -242,44 +187,16 @@ while [ $# -gt 0 ]; do
 done
 [ $# -gt 0 ] || { log "no command given after --"; exit 2; }
 
-# ---------------------------------------------------------------------------
-# GitHub credential precondition — BEFORE the lock, never after it.
-#
-# CLAUDE.md's own rule: "a 200 ms check must never be discovered after a
-# 1912-second lock wait." An invalid GITHUB_TOKEN/GH_TOKEN in the environment
-# overrides the working gh keyring credential, so `cargo` cannot fetch the
-# private `ay-milp` git dependency that crates/ny-mip pins, and EVERY cargo
-# command in this workspace dies at dependency resolution with zero tests run.
-# Measured 2026-08-28: rc=128 "Invalid username or token" with the token set,
-# rc=0 with it unset; the probe costs 0.356-0.479s over 3 runs and the no-token
-# fast path costs 0.025-0.027s. Discovering that after waiting out a 57-row
-# sweep costs the whole slot, and the failure reads as a broken tree.
-#
-# SCOPED TO CARGO/TARGO ON PURPOSE. `measure -- ./ny_pin …` needs no credential
-# at all, and adding a network probe in front of every measurement would put a
-# new failure mode (and new latency) on the path this script exists to protect.
-# So the check runs only when argv actually names a build tool.
-#
-# Guarded on NY_BOX_FCNTL_LOCKED so the macOS python re-exec below — which runs
-# this same script a second time with the lock already held — does not probe
-# twice.
+# Check build-tool credentials before waiting for the lock: a bad env token
+# can prevent fetching the pinned AY dependency. Solver-only commands skip the
+# probe, as does the macOS re-exec that already holds the lock.
 if [ "${NY_BOX_FCNTL_LOCKED:-0}" != 1 ] && [ "${NY_SKIP_CREDENTIAL_CHECK:-0}" != 1 ]; then
   needs_credential=0
   for word in "$@"; do
-    # ${word##*/} strips any directory so a FULL-PATH invocation still matches:
-    # `/opt/homebrew/bin/cargo` reduces to `cargo`. Without the strip the exact
-    # arms below miss it entirely — verified 2026-08-28 by mutation, which is
-    # also how the first version of this comment was caught being wrong. It had
-    # claimed the strip was there to stop `~/.cargo/bin/ny_pin` being refused;
-    # it is not, because the arms are exact or space-delimited and `.cargo`
-    # inside a path never matched either way. The pinned-binary case is safe on
-    # its own merits, and is pinned by a test regardless.
+    # Strip directories so full-path build-tool invocations also match.
     case "${word##*/}" in
       cargo|cargo.exe|targo|targo.exe) needs_credential=1; break ;;
-      # Runners in this campaign are written as `-- bash -c '…cargo…'`, where
-      # the whole script is ONE argv word, so a basename match alone misses
-      # them. CLAUDE.md records exactly such a runner: three steps that each
-      # exited 127 on `cargo: command not found` inside an inner `bash -c`.
+      # Also recognize build-tool commands inside a shell-script argument.
       "cargo "*|"targo "*|*" cargo "*|*" targo "*)
         needs_credential=1; break ;;
     esac
@@ -298,12 +215,7 @@ if [ "${NY_BOX_FCNTL_LOCKED:-0}" != 1 ] && [ "${NY_SKIP_CREDENTIAL_CHECK:-0}" !=
         exit 2
       fi
     else
-      # Deliberately a WARNING here where gate.sh refuses. gate.sh IS the drift
-      # gate, so a missing tracked file is its business; ny_box.sh's job is
-      # mutual exclusion, and refusing a build over a missing ADVISORY helper
-      # would add a new way to lose box access without preventing any
-      # contamination. What must not happen is losing the protection SILENTLY —
-      # that is the no-op-that-reads-as-a-pass shape — so say so out loud.
+      # Missing advisory helpers warn; gate.sh enforces tracked-file integrity.
       log "WARNING: $credential_checker is missing; running the credential"
       log "precondition was skipped. A bad GITHUB_TOKEN will now surface only"
       log "after the lock wait, at cargo dependency resolution."

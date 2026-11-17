@@ -1,9 +1,7 @@
 # Architecture Layer Policy
 #
-# Defines the target crate topology for ny (see docs/architecture-review-2026-02-07.md).
-# Validated by scripts/check_architecture_layers.py.
-#
-# Part of #2126, Part of #1696
+# Defines the crate topology; checked by scripts/check_architecture_layers.py.
+# See docs/ARCHITECTURE.md for the layer responsibilities.
 #
 # Layer rules:
 #   - Higher layers may depend on lower layers (L4 -> L3 -> L2 -> L1 -> L0).
@@ -16,18 +14,7 @@
 [layers]
 # L0: Foundational contracts, types, traits, and errors
 #
-# `ny-claims` is here because it depends on NOTHING internal — anyhow, clap,
-# serde, serde_json, sha2 and a dev-only tempfile — so at L0 it can never be a
-# downward violation and every layer may use it. It records executable
-# empirical claims (extractor + engagement witness + sensitivity set,
-# re-checkable against the artifacts they came from), which is a contract type.
-#
-# NOT sidecar, though it reads like one: `ny-cli` depends on it with a NORMAL
-# dependency (it ships as the `ny claims` subcommand), and the validator makes
-# a normal edge into a sidecar an error unless explicitly excepted — and this
-# file reserves exceptions for intentional UPWARD edges. Its own `[[bin]]`
-# exists as a fast path for hooks, not as evidence that it is out of the
-# runtime chain.
+# ny-claims has no internal dependencies and ships in the CLI runtime chain.
 L0 = ["ny-claims", "ny-contracts", "ny-core", "ny-levers"]
 
 # L1: Tensor representation
@@ -36,9 +23,7 @@ L1 = ["ny-tensor"]
 # L2: Verification, certificate, and acceleration engines
 L2 = [
     "ny-accelerate",
-    # UNTRUSTED search (ENGINE_PROGRAM §1.3). Depends on L0 `ny-core` ONLY —
-    # never on `ny-propagate` (peer), which in turn never depends on it; both
-    # directions are pinned by `crates/ny-bbe/tests/crate_dag_ratchet.rs`.
+    # Search hints only; crate_dag_ratchet.rs forbids edges to/from ny-propagate.
     "ny-bbe",
     "ny-cert",
     "ny-cuda",
@@ -46,17 +31,8 @@ L2 = [
     "ny-gpu",
     "ny-gpu-passthrough",
     "ny-mip",
-    # The offline proof-bundle checker (ENGINE_PROGRAM §1.7 B2). Its only
-    # internal dependency is L2 `ny-cert` (the total `json` reader/writer), so
-    # L2 is the lowest layer it fits and no edge into it or out of it is
-    # upward. The layer rule is the WEAK statement about it: that nothing but
-    # `ny-cli` may depend on it, and that it may depend on no producer crate
-    # (not `ny-propagate`, a same-layer peer), are pinned by
-    # `crates/ny-cli/tests/proof_check_ratchet.rs` and
-    # `crates/ny-proofcheck/tests/independence_ratchet.rs`. It entered the
-    # workspace in 5ccc91508 without an entry here, which this file's
-    # validator reports as an error; nothing ran the validator, because gate
-    # lane [g] stopped at an earlier failure.
+    # Offline checker; proof_check_ratchet.rs and independence_ratchet.rs
+    # restrict its consumers to ny-cli and its internal dependencies to ny-cert.
     "ny-proofcheck",
     "ny-propagate",
 ]

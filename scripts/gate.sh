@@ -49,13 +49,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Parse control-only arguments before resolving any gate prerequisite. Help is
-# repository documentation: it must remain available on a machine that has not
-# installed the pinned Trust frontend yet. Every executing mode continues into
-# the fail-closed frontend check below.
+# Parse help before prerequisites; executing modes still require pinned Trust.
 usage() {
-  # Print the header block: every line from line 2 up to the first non-comment
-  # line. This follows the header as checks and flags are added.
+  # Print the comment header, excluding the shebang.
   awk 'NR >= 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
@@ -172,12 +168,8 @@ fi
 # fast path; a rejected token refuses execution. Frontend resolution comes first.
 if [ "${NY_SKIP_CREDENTIAL_CHECK:-0}" != 1 ]; then
   CREDENTIAL_CHECK="$REPO_ROOT/scripts/check_github_credential.sh"
-  # Fail CLOSED on a missing checker rather than silently proceeding. Without
-  # this, deleting the script turns the precondition into a no-op that still
-  # "passes": bash exits 127, which is not 3, so the refusal below never fires.
-  # That is the same shape as `cargo test <filter>` exiting 0 on a filter that
-  # matched nothing — a check that cannot run must not read as a check that
-  # passed.
+  # A missing checker must refuse here: shell exit 127 would bypass the
+  # rejected-credential check for exit 3 below.
   if [ ! -r "$CREDENTIAL_CHECK" ]; then
     echo "gate.sh: $CREDENTIAL_CHECK is missing or unreadable." >&2
     echo "  It is a tracked file; its absence is repository drift, not a local choice." >&2

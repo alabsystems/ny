@@ -1,11 +1,9 @@
 # ny Makefile
 # Build, test, benchmark, and profile commands
 #
-# Development runs every Rust command through targo, the Trust toolchain's
-# cargo, in an explicit lane (owner directive 2026-09-28): the unverified lane
-# for builds/tests/benches (no proof claim), `targo tippy` / `targo fmt` for
-# lint and format; the verified lane is `targo trust check` (publish/config.sh).
-# The public snapshot ships this Makefile as it is.
+# Builds, tests and benchmarks use `targo --unverified` without a compiler proof;
+# lint and format use `targo tippy` / `targo fmt`. publish/config.sh defines the
+# release gate: an unverified workspace build and relaxation-envelope test floor.
 
 PYTHON ?= python3
 
@@ -21,7 +19,7 @@ build:
 build-debug:
 	targo --unverified build
 
-# Testing
+# Tests for the workspace's default members; see CONTRIBUTING.md for all crates.
 test:
 	targo --unverified test --release
 
@@ -161,11 +159,7 @@ fmt:
 fmt-fix:
 	targo fmt --all
 
-# Clean targets (for managing 10-50GB build artifacts)
-# Use 'make clean-debug' for incremental cleanup, 'make clean' for full reset
-
-# Remove debug artifacts only (keeps release builds, saves rebuild time)
-# Typically removes 10-20GB, keeps 2-3GB release artifacts
+# Remove debug artifacts while retaining release builds.
 clean-debug:
 	@echo "Removing debug build artifacts..."
 	rm -rf target/debug/
@@ -205,7 +199,7 @@ help:
 	@echo "  make build-debug  - Debug build"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test              - Run all Rust tests"
+	@echo "  make test              - Test default workspace members (release)"
 	@echo "  make test-verbose      - Run Rust tests with output"
 	@echo "  make test-python       - Build ny-python and run Python tests"
 	@echo "  make test-python-plugin - Run pytest plugin tests (no build)"

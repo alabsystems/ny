@@ -230,6 +230,18 @@ fn bounds_cooperative_whole_original_fold_corner_rational_containment() {
     )
     .unwrap();
     let w = [[1.25, -0.5], [-0.75, 0.25], [0.5, 0.75]];
+    // Exercise the production legacy composer with its actual RN dot caches
+    // as well as the cooperative lane above.
+    let legacy_via = compose_viay(
+        &eng,
+        &mb,
+        &gates,
+        &al,
+        &au,
+        &row_dots(&root, &al),
+        &row_dots(&root, &au),
+        RoundMode::Outward,
+    );
     let b = [-0.25, 0.125, -0.375];
     let out = [[1.0, 0.5, -0.25], [0.0, 0.25, 0.5], [-0.25, 0.75, 0.0]];
     let ob = [0.25, -0.125, 0.0];
@@ -261,7 +273,7 @@ fn bounds_cooperative_whole_original_fold_corner_rational_containment() {
                     for k in 0..3 {
                         truth += (q(out[0][k]) - q(out[j][k])) * &z[k];
                     }
-                    let claimed = direct[r0].max(ms.m1[r0]).max(via[r0]);
+                    let claimed = direct[r0].max(ms.m1[r0]).max(via[r0]).max(legacy_via[r0]);
                     assert!(
                         q(claimed) <= truth,
                         "row{r0} input{x0},{x1} fold{signs}: {claimed}"
@@ -672,7 +684,7 @@ fn bounds_cooperative_via_y_subnormal_products_cannot_preserve_legacy_positive()
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-struct HeadDirectedRounding {
+pub(super) struct HeadDirectedRounding {
     #[cfg(target_arch = "aarch64")]
     saved: u64,
     #[cfg(target_arch = "x86_64")]
@@ -682,7 +694,7 @@ struct HeadDirectedRounding {
 #[allow(deprecated)]
 impl HeadDirectedRounding {
     #[allow(unsafe_code)]
-    fn enter() -> Self {
+    pub(super) fn enter() -> Self {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let saved: u64;

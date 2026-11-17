@@ -4,26 +4,20 @@
 
 //! Frozen root gates from a forward DeepPoly (M/D) tableau (#twinwall).
 //!
-//! Port of the verified Python reference (`core.py::RootTableau`): a forward
-//! tableau `A_l = M - D`, `A_u = M + D` over augmented input rows, frozen
-//! DeepPoly gates per trunk relu chosen from the concretized boxes. In
-//! [`RoundMode::Outward`] every op charges a certified bound on its own
-//! rounding (Higham `gamma_n` per conv, per-site bounds elsewhere) into the
-//! `D` lane's BIAS column, where the sign is known, so the sandwich encloses
-//! the stored network for every input sign (#root-rounding); the boxes are
-//! concretized outward, and the upper gate lines are
-//! REPAIRED so `s*y + c >= relu(y)` holds in real arithmetic on the certified
-//! box (checked at the three kink points; `c` is bumped up on any deficit).
+//! A forward tableau `A_l = M - D`, `A_u = M + D` over augmented input rows
+//! supplies frozen DeepPoly gates from concretized boxes at each trunk ReLU. In
+//! [`RoundMode::Outward`], arithmetic and storage errors widen `D`; the f32
+//! lane also carries per-neuron `g_err` slack into outward concretization.
+//! Sign-safe charges preserve containment for either input sign. ReLU upper
+//! lines are repaired at the certified interval endpoints and kink so that
+//! `s*y + c >= relu(y)` holds throughout the box (#root-rounding).
 //!
 //! The tableau stops after the LAST trunk relu: the backward engine owns
 //! everything from there to the margin.
 //!
-//! #root-box-source (ENGINE_PROGRAM M5b): `margin_row.root_box_source:
-//! patch_backward` replaces this tableau as the source of the trunk boxes with
-//! a certified IBP reference plus a certified patch-backward pass over the
-//! reference-unstable neurons (`root_box.rs`). The declaration default
-//! `tableau` is this module's walk, unchanged; the dispatch is the one enum
-//! compare at the top of `build_retaining_inner`.
+//! #root-box-source: `margin_row.root_box_source: patch_backward` requests
+//! certified IBP plus patch-backward trunk boxes (`root_box.rs`). Conflicts or
+//! declined admission retain the tableau path. `tableau` is the declaration default.
 
 use ndarray::Array2;
 use ny_core::{NyError, Result};
@@ -31,13 +25,25 @@ use rayon::prelude::*;
 use std::time::Instant;
 
 use super::net::{
-    conv_apply_forward, conv_apply_forward_prec_masked, conv_forward_f32_native, ConvOp, TwinNet,
-    TwinOp,
+    conv_apply_forward, conv_apply_forward_prec_masked, conv_forward_f32_native,
+    conv_forward_f32_native_checked, ConvOp, TwinNet, TwinOp,
 };
 use super::rounding::{
     certify_up, f32_store_slack, gamma_n, gamma_n_f32, next_down, next_up, RoundMode,
     F32_MIN_POSITIVE, SUBNORMAL_F32, UNIT, UNIT_F32,
 };
+
+mod exceptional_conv;
+mod identity_conv;
+#[cfg(test)]
+mod owned_gates_tests;
+mod sparse_stem;
+#[cfg(test)]
+mod zero_add_tests;
+#[cfg(test)]
+mod zero_gate_tests;
+#[cfg(test)]
+pub(super) use identity_conv::with_identity_conv_trace_for_test;
 
 /// Completion authority minted only after this original unsplit builder has
 /// successfully constructed its actual gates. Sibling producers may consume
@@ -45,55 +51,20 @@ use super::rounding::{
 pub(super) struct CompletedOriginalRootAuthority(());
 
 // --------------------------------------------------------------------------
-//  #tableau-support-mask: exact column-block occupancy of the (M, D) tableau
+//  #tableau-support-mask: conservative column-block support of the M/D tableau
 // --------------------------------------------------------------------------
 //
-// WHAT THIS IS. Every tableau row is `naug = n_in + 1` wide (9409 on
-// tinyimagenet), but for the first ~two thirds of a conv stack most of that
-// width is EXACTLY ZERO: a neuron's row can only be nonzero on its receptive
-// field, and the receptive field does not cover the whole image until late.
-// The mask records, per tableau ROW, which of [`SUPPORT_BLOCKS`] equal column
-// blocks can hold a nonzero coefficient. Blocks outside it are skipped by the
-// forward conv, the gate application and the concretize reduction.
+// One u64 per row marks equal-width blocks that may contain nonzero M/D
+// coefficients. Every coefficient outside the mask is raw positive zero.
+// Identity seeds its diagonal and bias blocks; Conv unions gathered supports
+// and retains bias; Add unions operands. Rowwise ReLU/channel-affine transforms
+// retain support plus bias, while Flatten aliases it.
 //
-// THE INVARIANT (this is the whole soundness argument):
-//
-//   for every row j and every block b NOT set in mask[j],
-//   `M[j, i] == 0.0` and `D[j, i] == 0.0` EXACTLY for every column i in b.
-//
-// It is established at the identity input and preserved by every op:
-//   * conv  — out row (oc, sp) is a weighted sum of the gathered src rows, so
-//     its support is contained in their union; the D lane uses |W| over the
-//     same gather, so it has the same containment. The bias column is always
-//     retained (the conv folds `c.bias` / `c.bias_err` into it).
-//   * add   — union of the two operand masks.
-//   * relu/gate application, channel affine, flatten — per-row elementwise, so
-//     the mask is unchanged (plus the bias column, which `c[j]` / `shift[j]`
-//     writes into).
-//
-// WHY SKIPPING IS EXACT, NOT A RELAXATION. Inside a masked-out block both
-// operands of every one of these ops are exactly `0.0`, so the exact result is
-// exactly `0.0` and writing `0.0` is not an approximation — it IS the value.
-// The one place where today's code differs is the outward widening: `next_up`
-// maps `0.0` to `5e-324` (its smallest-subnormal branch), so the shipped lane
-// currently sprinkles subnormal dust across the provably-zero region and then
-// carries it. Dropping that dust makes `D` equal to its EXACT value rather than
-// a subnormal over-estimate of it, so the tableau stays a valid outward
-// enclosure — `D` is defined as an upper bound on the coefficient error, and
-// the error is exactly zero there. It is a change of at most ~1e-300 against
-// accumulators holding ~1e-1 with a ~1e-12 certified `gam` slack, i.e. below
-// the ulp of every sum it enters; the root bound is expected to print
-// identically, and that identity is the acceptance test for this change.
-//
-// Kill switch: `NY_MARGIN_ROW_SUPPORT_MASK=0` restores the dense passes.
+// Masked kernels, reductions and outward stores leave excluded blocks at exact
+// zero, avoiding artificial rounding dust there. Enabled with f32 compute
+// unless `NY_MARGIN_ROW_SUPPORT_MASK=0` selects dense passes.
 
-/// Number of equal column blocks tracked per tableau row (one `u64` of bits).
-///
-/// 64 is not a tuning parameter with headroom: replaying the real gather
-/// geometry of `TinyImageNet_resnet_medium` gives 64.4% mean occupancy at 64
-/// blocks and 62.5% at 128, against a ~60% floor for exact per-coefficient
-/// support. One machine word already captures essentially all of the available
-/// work elimination.
+/// Number of column blocks represented by one u64 per row.
 const SUPPORT_BLOCKS: usize = 64;
 
 /// Column-block width for a tableau of `naug` columns.
@@ -613,7 +584,7 @@ impl RetainedLayer {
 /// `f32` is the storage lane (active only when `root_f32` compute is armed and
 /// the mode is `Outward`); its role methods implement the (a)/(b)/(c) store
 /// classes documented on the `#tableau-f32` block above.
-pub(crate) trait TabElem: Copy + Send + Sync + 'static {
+pub(crate) trait TabElem: Copy + Send + Sync + super::net::ConvF32Dst + 'static {
     /// `true` on the f32 storage lane.
     const F32_STORE: bool;
     /// Additive zero (exact in both widths).
@@ -622,6 +593,16 @@ pub(crate) trait TabElem: Copy + Send + Sync + 'static {
     const ONE: Self;
     /// EXACT widening read (`f64` identity / `f32 -> f64`, no rounding).
     fn wide(self) -> f64;
+    /// Bit-exact proof read, including a stored f32 subnormal under DAZ.
+    fn proof_wide(self) -> f64 {
+        self.wide()
+    }
+    /// Test the raw +0 storage invariant without a DAZ-sensitive conversion.
+    fn is_positive_zero(self) -> bool;
+    /// Borrow the stored f32 bits without a DAZ-sensitive widen/narrow copy.
+    fn as_f32_slice(values: &[Self]) -> Option<&[f32]>;
+    /// Move a complete f32 accelerator output into its storage element type.
+    fn from_f32_vec(values: Vec<f32>) -> Option<Vec<Self>>;
     /// Class (c) store of a CENTER-role value: nearest store plus the
     /// certified perturbation bound to fold into the same-site D widening
     /// (`0.0` and unused on the f64 lane).
@@ -650,15 +631,51 @@ pub(crate) trait TabElem: Copy + Send + Sync + 'static {
         use_f32: bool,
         mask: Option<(&[u64], &[u64], usize)>,
     );
+
+    /// Native f32 overrides this with internal cooperative polling. Other
+    /// lanes retain boundary checks, without claiming cancellable BLAS calls.
+    fn conv_forward_checked(
+        c: &ConvOp,
+        src: &Array2<Self>,
+        dst: &mut Array2<Self>,
+        abs_w: bool,
+        use_f32: bool,
+        mask: Option<(&[u64], &[u64], usize)>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        check_forward_deadline(deadline)?;
+        Self::conv_forward_masked(c, src, dst, abs_w, use_f32, mask);
+        check_forward_deadline(deadline)
+    }
+}
+
+fn check_forward_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        Err(NyError::DeadlineExceeded(
+            "margin_row forward convolution".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 impl TabElem for f64 {
     const F32_STORE: bool = false;
     const ZERO: f64 = 0.0;
     const ONE: f64 = 1.0;
+    fn as_f32_slice(_: &[Self]) -> Option<&[f32]> {
+        None
+    }
+    fn from_f32_vec(_: Vec<f32>) -> Option<Vec<Self>> {
+        None
+    }
     #[inline]
     fn wide(self) -> f64 {
         self
+    }
+    #[inline]
+    fn is_positive_zero(self) -> bool {
+        self.to_bits() == 0
     }
     #[inline]
     fn store_center(v: f64) -> (f64, f64) {
@@ -685,9 +702,24 @@ impl TabElem for f32 {
     const F32_STORE: bool = true;
     const ZERO: f32 = 0.0;
     const ONE: f32 = 1.0;
+    fn as_f32_slice(values: &[Self]) -> Option<&[f32]> {
+        Some(values)
+    }
+    fn from_f32_vec(values: Vec<f32>) -> Option<Vec<Self>> {
+        Some(values)
+    }
     #[inline]
     fn wide(self) -> f64 {
         f64::from(self)
+    }
+    #[inline]
+    fn proof_wide(self) -> f64 {
+        ny_core::f32_to_f64_exact(self)
+    }
+
+    #[inline]
+    fn is_positive_zero(self) -> bool {
+        self.to_bits() == 0
     }
     #[inline]
     fn store_center(v: f64) -> (f32, f64) {
@@ -710,6 +742,19 @@ impl TabElem for f32 {
     ) {
         debug_assert!(use_f32, "f32 storage lane requires the f32 compute lane");
         conv_forward_f32_native(c, src, dst, abs_w, mask);
+    }
+
+    fn conv_forward_checked(
+        c: &ConvOp,
+        src: &Array2<f32>,
+        dst: &mut Array2<f32>,
+        abs_w: bool,
+        use_f32: bool,
+        mask: Option<(&[u64], &[u64], usize)>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        debug_assert!(use_f32, "f32 storage lane requires the f32 compute lane");
+        conv_forward_f32_native_checked(c, src, dst, abs_w, mask, deadline)
     }
 }
 
@@ -987,19 +1032,13 @@ impl RootGates {
         )
     }
 
-    /// #rebake: rebuild the forward tableau with a SEEDED lower-slope vector —
-    /// the joint-forward-re-bake round body (`rebake.rs`).
+    /// #rebake: rebuild the forward tableau with seeded lower slopes (`rebake.rs`).
     ///
-    /// `alpha_seed[li][j]` (one vector per trunk relu layer, layer width) is
-    /// baked in place of the `gates_from_box` heuristic wherever neuron `j`
-    /// is UNSTABLE in THIS build; stable and split-baked neurons keep their
-    /// exact fixed lines, out-of-range / non-finite / shape-mismatched seed
-    /// entries are ignored (fail-open to the heuristic). Any seeded value is
-    /// clamped to `[0, 1]`, so every baked lower line is a valid DeepPoly
-    /// relaxation and the build's own certificates (`repair_upper_lines`,
-    /// `ms = max(alpha, s)`, the fractional-alpha `apply_gates` widening)
-    /// apply verbatim — a rebaked build is certified by the SAME construction
-    /// as a plain one, for any seed whatsoever.
+    /// `alpha_seed[li][j]` replaces the area heuristic at unstable neurons only.
+    /// Stable and split-baked neurons keep their fixed lines; missing, nonfinite
+    /// or shape-mismatched seeds leave the heuristic. Finite seeds are clamped
+    /// to `[0, 1]`, preserving valid lower lines. The builder recomputes
+    /// `ms = max(alpha, s)` and uses the ordinary gate rounding charges.
     ///
     /// `bi` is an EXPLICIT backward-interm config (the caller re-budgets it
     /// per round); `None` skips the phase. `precision_policy` is the initial
@@ -1350,6 +1389,9 @@ impl RootGates {
         bi_policy: super::BackwardIntermRuntimePolicy,
         alpha_seed: Option<&[Vec<f64>]>,
     ) -> Result<(Self, Option<RetainedRows>)> {
+        let timing = std::env::var("NY_MARGIN_ROW_ROOT_TIMING").is_ok();
+        let mut progress =
+            timing.then(|| RootProgress::new(net.n_in, use_f32, T::F32_STORE, mode.outward()));
         debug_assert!(
             !T::F32_STORE || (use_f32 && mode.outward()),
             "f32 storage lane requires the f32 compute lane in Outward mode"
@@ -1412,7 +1454,7 @@ impl RootGates {
                 TwinOp::Gemm { .. } => {
                     return Err(NyError::InvalidSpec(
                         "margin_row: gemm before last trunk relu".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -1436,19 +1478,30 @@ impl RootGates {
             precision_policy.ibp_seed,
         );
 
-        // Identity tableau at the input (1.0/0.0 are exact in both widths).
-        let mut m0 = Array2::<T>::from_elem((n_in, naug), T::ZERO);
-        for i in 0..n_in {
-            m0[[i, i]] = T::ONE;
-        }
-        let d0 = Array2::<T>::from_elem((n_in, naug), T::ZERO);
+        // A sole first-Conv consumer can apply the identity without allocating
+        // its quadratic M/D storage. The plan admits an exact coefficient
+        // scatter and charges its actual weight conversions. Subsequent
+        // fold, bias, and propagation charges remain the ordinary ones.
+        let mut identity_first = if mode.outward()
+            && use_f32
+            && !legacy_round
+            && consumers[0] == 1
+            && !identity_conv::force_dense()
+        {
+            match net.ops.first() {
+                Some(TwinOp::Conv(c)) => identity_conv::plan(c, n_in, net.tsize[1], &xabs, s_xabs),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let sparse_admitted = identity_first.is_some() && sparse_stem::admit::<T>(net, &consumers);
         // Per-tensor certified f32-error accumulator `g_err[j]` (`Outward`+`use_f32`
         // only; empty otherwise). Invariant: `g_err[j] >=` the exact worst-case
         // perturbation of neuron j's concretized endpoints caused by running the
         // forward-conv lanes in f32 vs exact arithmetic, i.e.
         // `sum_i (|dM_ji| + |dD_ji|) * xabs_ext_i` (bias column weight 1). Consumed
         // as a pure additive concretize slack. Identity input carries zero error.
-        let g0: Vec<f64> = if use_f32 { vec![0.0; n_in] } else { Vec::new() };
         // #tableau-support-mask. Armed only alongside the f32 kernel (the only
         // conv lane that reads it) and only when the kill switch is absent.
         // Empty vectors elsewhere, which every consumer reads as "dense".
@@ -1460,47 +1513,30 @@ impl RootGates {
         } else {
             Vec::new()
         };
-        let mut state: Vec<Option<(Array2<T>, Array2<T>, Vec<f64>, Vec<u64>)>> =
-            vec![None; net.ops.len() + 1];
-        state[0] = Some((m0, d0, g0, s0));
+        let mut state: Vec<Option<sparse_stem::State<T>>> = vec![None; net.ops.len() + 1];
+        let mut implicit_support = Vec::new();
+        if identity_first.is_some() {
+            implicit_support = s0;
+        } else {
+            let mut m0 = Array2::<T>::from_elem((n_in, naug), T::ZERO);
+            for i in 0..n_in {
+                m0[[i, i]] = T::ONE;
+            }
+            let d0 = Array2::<T>::from_elem((n_in, naug), T::ZERO);
+            let g0 = if use_f32 { vec![0.0; n_in] } else { Vec::new() };
+            state[0] = Some(sparse_stem::State::dense(m0, d0, g0, s0));
+        }
         let mut layers = Vec::new();
         // Logical operator sites whose precision-sensitive work completed.
         // Flatten aliases existing storage, while the terminal ReLU only
         // concretizes a box and deliberately does not publish another tableau.
         let mut completed_conv_ops = 0usize;
         let mut completed_store_ops = 0usize;
-        // #epoch-carry: BI runs on the ROOT build and, when the caller asks for
-        // it, inside a Tier-2 epoch rebuild too.
-        //
-        // The gate used to be `splits.is_empty()`, which excluded EVERY epoch
-        // rebuild by construction — and that is why arming `NY_EPOCH_DEPTH`
-        // measured as a bound REGRESSION: the epoch re-entered idx_4169 at
-        // -0.389998 against its own parent's -0.371373 on a strict SUBSET of the
-        // box, which is impossible for a sound tightening, because
-        // `build_retaining` discarded 584 `#backward-interm`-tightened columns.
-        //
-        // The caller now decides, by handing in a policy whose `enabled` it
-        // actually means. `try_epoch` passed `BackwardIntermRuntimePolicy::default()`
-        // (enabled: false), so lifting this gate alone would have changed nothing
-        // — and would have reported `enabled=true` with every counter at zero,
-        // which reads as armed while running nothing. Both had to move together.
-        // NOTE the disjunction. On the ROOT (`splits.is_empty()`) the state is
-        // created even when the policy is DISABLED, because the terminal receipt
-        // must be able to prove a kill-switch suppressed an otherwise eligible
-        // phase without running a pass — dropping that would destroy the
-        // evidence path. Inside an epoch the state is created only when the
-        // caller actually armed BI.
-        // MEASURED 2026-08-30 (docs/EPOCH_CARRY_2026-08-30.md): re-running BI
-        // inside an epoch is UNAFFORDABLE. At depth 4 — the only trigger depth
-        // these rows reach — one epoch attempt consumed the whole remaining wall
-        // and cost the outer tree ~160 expansions (271 -> 111), with closure
-        // still 0.000; at depth >= 8 the epoch never fires at all. The original
-        // guard ("Tier-2 epoch rebuilds must not re-spend the budget mid-search")
-        // was a COST decision, not an oversight, and it is restored here.
-        //
-        // The cheap half of #epoch-carry is KEPT: `try_epoch` still seeds the
-        // rebuild with the root's optimised alpha, so an epoch no longer
-        // re-derives the `gates_from_box` area heuristic.
+        // #epoch-carry: BI runs only for unsplit Outward builds.
+        // Create state even for a disabled policy so its terminal receipt can
+        // record suppression. Split epoch rebuilds keep the alpha seed from
+        // `try_epoch` but do not rerun BI: measured cost consumed the remaining
+        // search budget (docs/EPOCH_CARRY_2026-08-30.md).
         let mut bi_state = if splits.is_empty() && mode.outward() {
             Some(
                 super::backward_interm::BiState::new(bi_policy, deadline)
@@ -1521,8 +1557,8 @@ impl RootGates {
         let mut retained_bytes = 0usize;
 
         // Optional per-op wall-clock breakdown (NY_MARGIN_ROW_ROOT_TIMING);
-        // pure diagnostics, no effect on any bound.
-        let timing = std::env::var("NY_MARGIN_ROW_ROOT_TIMING").is_ok();
+        // pure diagnostics, no effect on any bound. Keep this clock at its
+        // historical location; streaming progress separately includes setup.
         let build_t0 = Instant::now();
         let mut op_times: Vec<(usize, &'static str, usize, f64)> = Vec::new();
 
@@ -1546,178 +1582,354 @@ impl RootGates {
                 }
             }
             let op_t0 = Instant::now();
+            if let Some(progress) = progress.as_mut() {
+                let kind = match op {
+                    TwinOp::Conv(_) => "conv",
+                    TwinOp::Relu { .. } => "relu",
+                    TwinOp::Add { .. } => "add",
+                    TwinOp::Flatten { .. } => "flatten",
+                    TwinOp::ChannelAffine { .. } => "channel_affine",
+                    TwinOp::Gemm { .. } => "gemm",
+                };
+                progress.begin_op(k, kind, net.tsize[k + 1], op_t0);
+            }
             // #mr-ibp-seed: advance the interval state over this op (a ReLU's
             // output is set later, from its FINAL published box).
             if let Some(seed) = ibp.as_mut() {
                 seed.forward(net, k, op);
             }
-            let take = |st: &mut Vec<Option<(Array2<T>, Array2<T>, Vec<f64>, Vec<u64>)>>,
-                        cons: &mut Vec<usize>,
-                        id: usize|
-             -> Result<(Array2<T>, Array2<T>, Vec<f64>, Vec<u64>, bool)> {
-                let last = cons[id] == 1;
-                cons[id] -= 1;
-                let entry = st[id]
-                    .as_ref()
-                    .ok_or_else(|| NyError::InvalidSpec("margin_row: dead tensor".into()))?;
-                if last {
-                    let owned = st[id].take().expect("checked above");
-                    Ok((owned.0, owned.1, owned.2, owned.3, true))
-                } else {
-                    Ok((
-                        entry.0.clone(),
-                        entry.1.clone(),
-                        entry.2.clone(),
-                        entry.3.clone(),
-                        false,
-                    ))
-                }
-            };
             match op {
                 TwinOp::Conv(c) => {
-                    let (mi, di, gerr_in, smask_in, _) = take(&mut state, &mut consumers, c.input)?;
-                    let n_out = net.tsize[k + 1];
-                    // #tableau-support-mask: the output row support is the union
-                    // of the gathered source rows' supports (plus the bias column
-                    // the folds below write into).
-                    let smask_out: Vec<u64> = if use_mask {
-                        support_conv(c, &smask_in, n_out, bias_bit)
-                    } else {
-                        Vec::new()
-                    };
-                    let cmask: Option<(&[u64], &[u64], usize)> = if use_mask {
-                        Some((&smask_in, &smask_out, SUPPORT_BLOCKS))
+                    if k == 0 && sparse_admitted {
+                        let plan = identity_first.take().expect("admitted identity plan");
+                        consumers[0] -= 1;
+                        let n_out = net.tsize[1];
+                        let smask_out = if use_mask {
+                            support_conv(c, &implicit_support, n_out, bias_bit)
+                        } else {
+                            Vec::new()
+                        };
+                        implicit_support.clear();
+                        let mut rows = identity_conv::packed_center(c, &plan, n_in, deadline)?;
+                        let mut gerr = identity_conv::error(c, &plan, &xabs);
+                        let conv_fold = match fold_mag.as_ref() {
+                            Some(fm) => Some(conv_fold_ball(c, fm.get(0)?, n_out)),
+                            None => None,
+                        };
+                        let bias_err = conv_fold
+                            .as_ref()
+                            .map_or(c.bias_err.as_slice(), |f| f.bias_err.as_slice());
+                        let physical_bias = rows.bias_column();
+                        conv_bias_fold(
+                            &mut rows.m,
+                            &mut rows.d,
+                            &c.bias,
+                            bias_err,
+                            c.oshape.1 * c.oshape.2,
+                            physical_bias,
+                            mode,
+                            &mut gerr,
+                        );
+                        #[cfg(test)]
+                        identity_conv::capture_packed(&rows, &gerr, &smask_out);
+                        if timing {
+                            eprintln!("[root-sparse-stem] applied: rows={n_out} packed_bytes={} dense_pair_bytes={}",
+                                rows.allocated_bytes(), 2u128 * n_out as u128 * naug as u128 * size_of::<T>() as u128);
+                            op_times.push((k, "conv", n_out, op_t0.elapsed().as_secs_f64()));
+                        }
+                        let output = sparse_stem::State::packed(rows, gerr, smask_out);
+                        #[cfg(test)]
+                        let output = {
+                            let mut output = output;
+                            sparse_stem::record(0);
+                            if sparse_stem::materialize_immediately() {
+                                let sparse_stem::ReluRows::Packed(rows) = &output.rows else {
+                                    unreachable!()
+                                };
+                                let (m, d) = rows.materialize_checked(deadline)?;
+                                output.rows = sparse_stem::ReluRows::Dense(m, d);
+                            }
+                            output
+                        };
+                        state[1] = Some(output);
+                        if let (Some(fm), Some(f)) = (fold_mag.as_mut(), conv_fold) {
+                            fm.set(1, f.mag_out);
+                            fm.release(0);
+                        }
+                        completed_conv_ops += 1;
+                        completed_store_ops += 1;
+                        if let Some(progress) = progress.as_mut() {
+                            progress.end_op(root_progress_layout(&state[k + 1]));
+                        }
+                        continue;
+                    }
+                    // Every compact Conv independently admits its own geometry and
+                    // weights. Unsupported cases enter the ordinary repaired dense path.
+                    let compact_output = if k > 0 {
+                        let source = sparse_stem::borrow(&state, &consumers, c.input)?;
+                        if let sparse_stem::ReluRows::Packed(rows) = &source.rows {
+                            debug_assert!(
+                                T::F32_STORE && use_f32 && mode.outward() && !legacy_round
+                            );
+                            let n_out = net.tsize[k + 1];
+                            if fold_mag.is_none() && c.weight_rel_err != 0.0 {
+                                None
+                            } else if let Some(mut out) = rows.contract_packed(c, deadline)? {
+                                let conv_fold = match fold_mag.as_ref() {
+                                    Some(fm) => Some(conv_fold_ball(c, fm.get(c.input)?, n_out)),
+                                    None => None,
+                                };
+                                let mut gerr =
+                                    rows.conv_error(c, &source.gerr, &xabs, s_xabs, deadline)?;
+                                let support = if use_mask {
+                                    support_conv(c, &source.support, n_out, bias_bit)
+                                } else {
+                                    Vec::new()
+                                };
+                                let bias_err = conv_fold
+                                    .as_ref()
+                                    .map_or(c.bias_err.as_slice(), |f| f.bias_err.as_slice());
+                                let physical_bias = out.bias_column();
+                                conv_bias_fold(
+                                    &mut out.m,
+                                    &mut out.d,
+                                    &c.bias,
+                                    bias_err,
+                                    c.oshape.1 * c.oshape.2,
+                                    physical_bias,
+                                    mode,
+                                    &mut gerr,
+                                );
+                                Some((sparse_stem::State::packed(out, gerr, support), conv_fold))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
-                    let mut mo = Array2::<T>::from_elem((n_out, naug), T::ZERO);
-                    // M lane (f64 default, f32 fast path stored back exactly, or
-                    // #tableau-f32 native f32 store — all publish the same number
-                    // for a given compute lane; store class (a), zero new error).
-                    T::conv_forward_masked(c, &mi, &mut mo, false, use_f32, cmask);
-                    let mut do_ = Array2::<T>::from_elem((n_out, naug), T::ZERO);
-                    // g_err accumulation for the f32 fast path (see conv_f32_gerr
-                    // doc): g_err_out = conv_abs(g_err_in + gamma_f32 * B) + FTZ
-                    // floor, with B[t] = sum_i (|mi_ti| + |din_ti|) * xabs_ext_i
-                    // (`din` is the D lane the conv consumes: `di` itself on the
-                    // #root-rounding path, the widened one on the legacy path).
-                    let mut gerr_out: Vec<f64> = Vec::new();
-                    // #fold-ball: when the walk tracks certified magnitudes (some
-                    // op carries a RELATIVE fold error), this conv's
-                    // `weight_rel_err` is charged SIGN-SAFELY into the D BIAS
-                    // column (`FoldMag` docs) and `rel_d` below is 0; otherwise
-                    // every relative fold error is 0 (outside the TEST-ONLY
-                    // legacy switch, which runs the whole pre-repair walk).
-                    let conv_fold = match fold_mag.as_ref() {
-                        Some(fm) => Some(conv_fold_ball(c, fm.get(c.input)?, n_out)),
-                        None => None,
-                    };
-                    if mode.outward() && !legacy_round {
-                        // #root-rounding: NO coefficient-column widening. The M
-                        // and D lanes are the plain products `W M`, `|W| D`, and
-                        // their rounding is charged SIGN-SAFELY into the D bias
-                        // column (#root-rounding block comment):
-                        // `E_o = g sum_t |W_ot| sum_i (|M_ti| + |D_ti|) xabs_ext_i`.
-                        // On the f32 compute lane `conv_f32_gerr` already charges
-                        // both lanes' error against exact arithmetic into `g_err`
-                        // (the same sign-safe account), so `E` is added only on
-                        // the f64 lane — or if a relative fold error reached this
-                        // conv, which the walk's invariant forbids (`FoldMag` is
-                        // `Some` whenever one exists outside the legacy switch)
-                        // but which `g` would still charge soundly.
-                        let rel_d = if conv_fold.is_some() {
-                            0.0
-                        } else {
-                            c.weight_rel_err
-                        };
-                        let g =
-                            next_up(gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d);
-                        if use_f32 {
-                            gerr_out = conv_f32_gerr(
-                                c,
-                                &mi,
-                                &di,
-                                &gerr_in,
-                                &xabs,
-                                s_xabs,
-                                n_in,
-                                if use_mask { Some(&smask_in) } else { None },
-                                blk,
-                                T::F32_STORE,
+                    let (output, conv_fold) = if let Some(output) = compact_output {
+                        sparse_stem::release(&mut state, &mut consumers, c.input)?;
+                        #[cfg(test)]
+                        sparse_stem::record(k);
+                        if timing {
+                            eprintln!(
+                                "[root-sparse-rows] conv: op={k} source={} remaining={}",
+                                c.input, consumers[c.input]
                             );
                         }
-                        T::conv_forward_masked(c, &di, &mut do_, true, use_f32, cmask);
-                        if !use_f32 || rel_d != 0.0 {
-                            let e =
-                                conv_round_charge(c, &mi, &di, &xabs, n_in, n_out, g, round_floor);
-                            charge_bias_column(&mut do_, &e, n_in, &mut gerr_out);
-                        }
-                    } else if mode.outward() {
-                        // HISTORICAL coefficient-column charge (TEST-ONLY legacy
-                        // switch, `with_legacy_rounding_charge_for_test`).
-                        // D input absorbs the M-product error: Din = D + g(|M| + D).
-                        let rel_d = if conv_fold.is_some() {
-                            0.0
-                        } else {
-                            c.weight_rel_err
-                        };
-                        let g =
-                            next_up(gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d);
-                        let mut din = Array2::<T>::from_elem(mi.raw_dim(), T::ZERO);
-                        // Masked-out columns have `m == d == 0.0`, so the exact
-                        // result is `0.0` and the zeroed `din` already holds it.
-                        // #tableau-f32: `din` is RADIUS-role — stored directed-UP
-                        // (class (b)); the up-rounded value feeds both consumers
-                        // in their loosening direction (bigger B[t] in g_err,
-                        // bigger |W|-gathered D output).
-                        par_zip2_radius_masked(&mut din, &mi, &di, &smask_in, blk, |m, d| {
-                            d + g * (m.abs() + d)
-                        });
-                        if use_f32 {
-                            gerr_out = conv_f32_gerr(
-                                c,
-                                &mi,
-                                &din,
-                                &gerr_in,
-                                &xabs,
-                                s_xabs,
-                                n_in,
-                                if use_mask { Some(&smask_in) } else { None },
-                                blk,
-                                T::F32_STORE,
-                            );
-                        }
-                        T::conv_forward_masked(c, &din, &mut do_, true, use_f32, cmask);
-                        let g2 = gamma_n(c.k_fwd + 8);
-                        // Same argument: `certify_up` of an exact `0.0` is `0.0`
-                        // (its `next_up` would otherwise return 5e-324 dust).
-                        // #tableau-f32: radius-role re-store is directed UP.
-                        map_radius_masked(&mut do_, &smask_out, blk, |v| certify_up(v, g2));
+                        output
                     } else {
-                        T::conv_forward_masked(c, &di, &mut do_, true, use_f32, cmask);
-                    }
-                    // Bias into the M bias column (+ certified bias error into D).
-                    // #tableau-f32: the bias fold is a CENTER-role nearest store
-                    // (class (c)); its perturbation is charged into the same-site
-                    // D bias widening (stored UP, class (b)) AND its storage
-                    // dust into g_err (bias-column weight 1.0).
-                    let p = c.oshape.1 * c.oshape.2;
-                    // #fold-ball: the sign-safe relative-fold charge rides in the
-                    // per-channel bias error (bias column, weight 1 > 0).
-                    let bias_err: &[f64] = conv_fold
-                        .as_ref()
-                        .map_or(c.bias_err.as_slice(), |f| f.bias_err.as_slice());
-                    conv_bias_fold(
-                        &mut mo,
-                        &mut do_,
-                        &c.bias,
-                        bias_err,
-                        p,
-                        n_in,
-                        mode,
-                        &mut gerr_out,
-                    );
-                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
+                        let identity = if k == 0 { identity_first.take() } else { None };
+                        let (dense, smask_in) = if identity.is_some() {
+                            debug_assert_eq!(c.input, 0);
+                            debug_assert_eq!(consumers[0], 1);
+                            consumers[0] -= 1;
+                            (None, std::mem::take(&mut implicit_support))
+                        } else {
+                            let (mi, di, gi, si) = sparse_stem::take_dense(
+                                &mut state,
+                                &mut consumers,
+                                c.input,
+                                deadline,
+                            )?;
+                            (Some((mi, di, gi)), si)
+                        };
+                        let n_out = net.tsize[k + 1];
+                        // #tableau-support-mask: the output row support is the union
+                        // of the gathered source rows' supports (plus the bias column
+                        // the folds below write into).
+                        let smask_out: Vec<u64> = if use_mask {
+                            support_conv(c, &smask_in, n_out, bias_bit)
+                        } else {
+                            Vec::new()
+                        };
+                        let cmask: Option<(&[u64], &[u64], usize)> = if use_mask {
+                            Some((&smask_in, &smask_out, SUPPORT_BLOCKS))
+                        } else {
+                            None
+                        };
+                        check_forward_deadline(deadline)?;
+                        let mut mo = Array2::<T>::from_elem((n_out, naug), T::ZERO);
+                        // M lane (f64 default, f32 fast path stored back exactly, or
+                        // #tableau-f32 native f32 store — all publish the same number
+                        // for a given compute lane; store class (a), zero new error).
+                        if let Some(plan) = identity.as_ref() {
+                            identity_conv::center(c, plan, &mut mo);
+                        } else {
+                            let (mi, _, _) = dense.as_ref().expect("dense Conv source");
+                            T::conv_forward_checked(
+                                c, mi, &mut mo, false, use_f32, cmask, deadline,
+                            )?;
+                        }
+                        check_forward_deadline(deadline)?;
+                        let mut do_ = Array2::<T>::from_elem((n_out, naug), T::ZERO);
+                        check_forward_deadline(deadline)?;
+                        // Dense f32 products use conv_f32_gerr for arithmetic and
+                        // storage error; identity scatter charges only its actual
+                        // weight conversions. Both feed the shared bias fold below.
+                        let mut gerr_out: Vec<f64> = Vec::new();
+                        // #fold-ball: when the walk tracks certified magnitudes (some
+                        // op carries a RELATIVE fold error), this conv's
+                        // `weight_rel_err` is charged SIGN-SAFELY into the D BIAS
+                        // column (`FoldMag` docs) and `rel_d` below is 0; otherwise
+                        // every relative fold error is 0 (outside the TEST-ONLY
+                        // legacy switch, which runs the whole pre-repair walk).
+                        let conv_fold = match fold_mag.as_ref() {
+                            Some(fm) => Some(conv_fold_ball(c, fm.get(c.input)?, n_out)),
+                            None => None,
+                        };
+                        if mode.outward() && !legacy_round {
+                            // #root-rounding: coefficients stay unwidened. The f32
+                            // path charges g_err through its selected helper;
+                            // f64 products charge the D bias below. FoldMag
+                            // handles relative parameter error separately, leaving
+                            // rel_d=0; any residual is included in the bias charge.
+                            let rel_d = if conv_fold.is_some() {
+                                0.0
+                            } else {
+                                c.weight_rel_err
+                            };
+                            let g = next_up(
+                                gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d,
+                            );
+                            if use_f32 {
+                                gerr_out = if let Some(plan) = identity.as_ref() {
+                                    identity_conv::error(c, plan, &xabs)
+                                } else {
+                                    let (mi, di, gi) = dense.as_ref().expect("dense Conv source");
+                                    conv_f32_gerr(
+                                        c,
+                                        mi,
+                                        di,
+                                        gi,
+                                        &xabs,
+                                        s_xabs,
+                                        n_in,
+                                        if use_mask { Some(&smask_in) } else { None },
+                                        blk,
+                                        T::F32_STORE,
+                                    )
+                                };
+                            }
+                            if let Some((_, di, _)) = dense.as_ref() {
+                                T::conv_forward_checked(
+                                    c, di, &mut do_, true, use_f32, cmask, deadline,
+                                )?;
+                            }
+                            if !use_f32 || rel_d != 0.0 {
+                                let (mi, di, _) =
+                                    dense.as_ref().expect("dense rounding-charge source");
+                                let e = conv_round_charge(
+                                    c,
+                                    mi,
+                                    di,
+                                    &xabs,
+                                    n_in,
+                                    n_out,
+                                    g,
+                                    round_floor,
+                                );
+                                charge_bias_column(&mut do_, &e, n_in, &mut gerr_out);
+                            }
+                        } else if mode.outward() {
+                            let (mi, di, gerr_in) = dense.as_ref().expect("dense legacy source");
+                            // HISTORICAL coefficient-column charge (TEST-ONLY legacy
+                            // switch, `with_legacy_rounding_charge_for_test`).
+                            // D input absorbs the M-product error: Din = D + g(|M| + D).
+                            let rel_d = if conv_fold.is_some() {
+                                0.0
+                            } else {
+                                c.weight_rel_err
+                            };
+                            let g = next_up(
+                                gamma_n(c.k_fwd + 2) + rel_d + gamma_n(c.k_fwd + 2) * rel_d,
+                            );
+                            let mut din = Array2::<T>::from_elem(mi.raw_dim(), T::ZERO);
+                            // Masked-out columns have `m == d == 0.0`, so the exact
+                            // result is `0.0` and the zeroed `din` already holds it.
+                            // #tableau-f32: `din` is RADIUS-role — stored directed-UP
+                            // (class (b)); the up-rounded value feeds both consumers
+                            // in their loosening direction (bigger B[t] in g_err,
+                            // bigger |W|-gathered D output).
+                            par_zip2_radius_masked(&mut din, mi, di, &smask_in, blk, |m, d| {
+                                d + g * (m.abs() + d)
+                            });
+                            if use_f32 {
+                                gerr_out = conv_f32_gerr(
+                                    c,
+                                    mi,
+                                    &din,
+                                    gerr_in,
+                                    &xabs,
+                                    s_xabs,
+                                    n_in,
+                                    if use_mask { Some(&smask_in) } else { None },
+                                    blk,
+                                    T::F32_STORE,
+                                );
+                            }
+                            T::conv_forward_checked(
+                                c, &din, &mut do_, true, use_f32, cmask, deadline,
+                            )?;
+                            let g2 = gamma_n(c.k_fwd + 8);
+                            // Same argument: `certify_up` of an exact `0.0` is `0.0`
+                            // (its `next_up` would otherwise return 5e-324 dust).
+                            // #tableau-f32: radius-role re-store is directed UP.
+                            map_radius_masked(&mut do_, &smask_out, blk, |v| certify_up(v, g2));
+                        } else {
+                            let (_, di, _) = dense.as_ref().expect("dense parity source");
+                            T::conv_forward_checked(
+                                c, di, &mut do_, true, use_f32, cmask, deadline,
+                            )?;
+                        }
+                        // Bias into the M bias column (+ certified bias error into D).
+                        // #tableau-f32: the bias fold is a CENTER-role nearest store
+                        // (class (c)); its perturbation is charged into the same-site
+                        // D bias widening (stored UP, class (b)) AND its storage
+                        // dust into g_err (bias-column weight 1.0).
+                        let p = c.oshape.1 * c.oshape.2;
+                        // #fold-ball: the sign-safe relative-fold charge rides in the
+                        // per-channel bias error (bias column, weight 1 > 0).
+                        let bias_err: &[f64] = conv_fold
+                            .as_ref()
+                            .map_or(c.bias_err.as_slice(), |f| f.bias_err.as_slice());
+                        conv_bias_fold(
+                            &mut mo,
+                            &mut do_,
+                            &c.bias,
+                            bias_err,
+                            p,
+                            n_in,
+                            mode,
+                            &mut gerr_out,
+                        );
+                        #[cfg(test)]
+                        if k == 0 {
+                            identity_conv::capture(
+                                identity.is_some(),
+                                &mo,
+                                &do_,
+                                &gerr_out,
+                                &smask_out,
+                            );
+                        }
+                        if timing && identity.is_some() {
+                            let avoided_bytes =
+                                2u128 * n_in as u128 * naug as u128 * size_of::<T>() as u128;
+                            eprintln!(
+                                "[root-identity-conv] applied: input={n_in} output={n_out} avoided_input_tableau_bytes={avoided_bytes}"
+                            );
+                        }
+                        (
+                            sparse_stem::State::dense(mo, do_, gerr_out, smask_out),
+                            conv_fold,
+                        )
+                    };
+                    check_forward_deadline(deadline)?;
+                    state[k + 1] = Some(output);
                     if let (Some(fm), Some(f)) = (fold_mag.as_mut(), conv_fold) {
                         fm.set(k + 1, f.mag_out);
                         fm.release(c.input);
@@ -1726,40 +1938,98 @@ impl RootGates {
                     completed_store_ops += 1;
                 }
                 TwinOp::Add { lhs, rhs } => {
-                    let (ma, da, ga, sa_, _) = take(&mut state, &mut consumers, *lhs)?;
-                    let (mb, db, gb, sb_, _) = take(&mut state, &mut consumers, *rhs)?;
-                    // Support of an elementwise sum is the union of the operands'.
-                    let smask_out: Vec<u64> = if use_mask {
-                        sa_.iter().zip(&sb_).map(|(a, b)| a | b).collect()
-                    } else {
-                        Vec::new()
+                    let fold_sum = match fold_mag.as_ref() {
+                        Some(fm) => Some(fold_mag_add(fm.get(*lhs)?, fm.get(*rhs)?)),
+                        None => None,
                     };
-                    // #tableau-f32: the sum is CENTER-role (nearest store, class
-                    // (c), charge folded into the same-site D widening); the D
-                    // result is RADIUS-role (directed-UP store, class (b)); the
-                    // storage dust is charged into g_err (`gstore`, fused).
-                    let (mo, do_, gstore) =
-                        add_op(ma, &mb, da, &db, &smask_out, blk, mode, &xabs_ext);
-                    // f32 error is additive across the two branches: the elementwise
-                    // sum's coefficient errors add (its own f64 add rounding is a
-                    // second-order effect on the errors, absorbed by next_up).
-                    let gerr_out: Vec<f64> = if use_f32 {
-                        if T::F32_STORE {
-                            ga.iter()
-                                .zip(&gb)
-                                .zip(&gstore)
-                                .map(|((a, b), gs)| next_up(next_up(a + b) + gs))
-                                .collect()
-                        } else {
-                            // Bit-identical shipped expression.
-                            ga.iter().zip(&gb).map(|(a, b)| next_up(a + b)).collect()
+                    let compact_output = {
+                        let a = sparse_stem::borrow(&state, &consumers, *lhs)?;
+                        let b = sparse_stem::borrow(&state, &consumers, *rhs)?;
+                        if lhs == rhs && consumers[*lhs] < 2 {
+                            return Err(NyError::InvalidSpec(
+                                "margin_row: missing second Add use".into(),
+                            ));
                         }
-                    } else {
-                        Vec::new()
+                        match (&a.rows, &b.rows) {
+                            (
+                                sparse_stem::ReluRows::Packed(left),
+                                sparse_stem::ReluRows::Packed(right),
+                            ) => {
+                                debug_assert!(
+                                    T::F32_STORE && use_f32 && mode.outward() && !legacy_round
+                                );
+                                left.add_packed(right, &xabs_ext, deadline)?.map(
+                                    |(rows, gstore)| {
+                                        let gerr = a
+                                            .gerr
+                                            .iter()
+                                            .zip(&b.gerr)
+                                            .zip(&gstore)
+                                            .map(|((ga, gb), gs)| next_up(next_up(ga + gb) + gs))
+                                            .collect();
+                                        let support = if use_mask {
+                                            a.support
+                                                .iter()
+                                                .zip(&b.support)
+                                                .map(|(a, b)| a | b)
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        sparse_stem::State::packed(rows, gerr, support)
+                                    },
+                                )
+                            }
+                            _ => None,
+                        }
                     };
-                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
-                    if let Some(fm) = fold_mag.as_mut() {
-                        let sum = fold_mag_add(fm.get(*lhs)?, fm.get(*rhs)?);
+                    let output = if let Some(output) = compact_output {
+                        sparse_stem::release(&mut state, &mut consumers, *lhs)?;
+                        sparse_stem::release(&mut state, &mut consumers, *rhs)?;
+                        #[cfg(test)]
+                        sparse_stem::record_add(k);
+                        if timing {
+                            eprintln!("[root-sparse-rows] add: op={k} lhs={lhs} rhs={rhs}");
+                        }
+                        output
+                    } else {
+                        let (ma, da, ga, sa_) =
+                            sparse_stem::take_dense(&mut state, &mut consumers, *lhs, deadline)?;
+                        let (mb, db, gb, sb_) =
+                            sparse_stem::take_dense(&mut state, &mut consumers, *rhs, deadline)?;
+                        // Support of an elementwise sum is the union of the operands'.
+                        let smask_out: Vec<u64> = if use_mask {
+                            sa_.iter().zip(&sb_).map(|(a, b)| a | b).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        // #tableau-f32: the sum is CENTER-role (nearest store, class
+                        // (c), charge folded into the same-site D widening); the D
+                        // result is RADIUS-role (directed-UP store, class (b)); the
+                        // storage dust is charged into g_err (`gstore`, fused).
+                        let (mo, do_, gstore) =
+                            add_op(ma, &mb, da, &db, &smask_out, blk, mode, &xabs_ext);
+                        // f32 error is additive across the two branches: the elementwise
+                        // sum's coefficient errors add (its own f64 add rounding is a
+                        // second-order effect on the errors, absorbed by next_up).
+                        let gerr_out: Vec<f64> = if use_f32 {
+                            if T::F32_STORE {
+                                ga.iter()
+                                    .zip(&gb)
+                                    .zip(&gstore)
+                                    .map(|((a, b), gs)| next_up(next_up(a + b) + gs))
+                                    .collect()
+                            } else {
+                                // Bit-identical shipped expression.
+                                ga.iter().zip(&gb).map(|(a, b)| next_up(a + b)).collect()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        sparse_stem::State::dense(mo, do_, gerr_out, smask_out)
+                    };
+                    state[k + 1] = Some(output);
+                    if let (Some(fm), Some(sum)) = (fold_mag.as_mut(), fold_sum) {
                         fm.set(k + 1, sum);
                         fm.release(*lhs);
                         fm.release(*rhs);
@@ -1767,8 +2037,8 @@ impl RootGates {
                     completed_store_ops += 1;
                 }
                 TwinOp::Flatten { input } => {
-                    let (mi, di, gi, si, _) = take(&mut state, &mut consumers, *input)?;
-                    state[k + 1] = Some((mi, di, gi, si));
+                    let source = sparse_stem::take_rows(&mut state, &mut consumers, *input)?;
+                    state[k + 1] = Some(source);
                     if let Some(fm) = fold_mag.as_mut() {
                         let same = fm.get(*input)?.to_vec();
                         fm.set(k + 1, same);
@@ -1785,8 +2055,8 @@ impl RootGates {
                     // Diagonal affine on the tableau: M' = s ⊙ M (+ shift in
                     // the bias column); D' = |s| ⊙ D widened by the certified
                     // parameter/rounding envelope in Outward mode.
-                    let (mut mi, mut di, gerr_in, smask_in, _) =
-                        take(&mut state, &mut consumers, *input)?;
+                    let (mut mi, mut di, gerr_in, smask_in) =
+                        sparse_stem::take_dense(&mut state, &mut consumers, *input, deadline)?;
                     // Diagonal scaling is per-row elementwise, so the support is
                     // unchanged; the shift only touches the (always live) bias
                     // column.
@@ -1853,7 +2123,7 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    state[k + 1] = Some((mi, di, gerr_out, smask_out));
+                    state[k + 1] = Some(sparse_stem::State::dense(mi, di, gerr_out, smask_out));
                     if let (Some(fm), Some(f)) = (fold_mag.as_mut(), affine_fold) {
                         fm.set(k + 1, f.mag_out);
                         fm.release(*input);
@@ -1861,25 +2131,39 @@ impl RootGates {
                     completed_store_ops += 1;
                 }
                 TwinOp::Relu { input, layer } => {
-                    let (mi, di, gerr_in, smask_in, _) = take(&mut state, &mut consumers, *input)?;
+                    let sparse_stem::State {
+                        rows,
+                        gerr: gerr_in,
+                        support: smask_in,
+                    } = sparse_stem::take_rows(&mut state, &mut consumers, *input)?;
                     let n = net.tsize[k + 1];
                     let f32_gerr = if use_f32 {
                         Some(gerr_in.as_slice())
                     } else {
                         None
                     };
-                    let (mut l, mut u) = concretize_box(
-                        &mi,
-                        &di,
-                        &mid,
-                        &rad,
-                        &xabs,
-                        mode,
-                        net.trunk_relus.len(),
-                        f32_gerr,
-                        if use_mask { Some(&smask_in) } else { None },
-                        blk,
-                    );
+                    let (mut l, mut u) = match &rows {
+                        sparse_stem::ReluRows::Dense(mi, di) => concretize_box(
+                            mi,
+                            di,
+                            &mid,
+                            &rad,
+                            &xabs,
+                            mode,
+                            net.trunk_relus.len(),
+                            f32_gerr,
+                            if use_mask { Some(&smask_in) } else { None },
+                            blk,
+                        ),
+                        sparse_stem::ReluRows::Packed(rows) => rows.concretize(
+                            &mid,
+                            &rad,
+                            &xabs,
+                            net.trunk_relus.len(),
+                            &gerr_in,
+                            deadline,
+                        )?,
+                    };
                     for v in l.iter().chain(u.iter()) {
                         if !v.is_finite() {
                             return Err(NyError::NumericalInstability(
@@ -1970,16 +2254,10 @@ impl RootGates {
                         repair_upper_lines(&l, &u, &mut gates.1, &mut gates.2);
                     }
                     let (mut alpha, mut s, mut c) = gates;
-                    // #rebake seed: bake a previous round's optimized alpha in
-                    // place of the area heuristic, UNSTABLE neurons only (a
-                    // stable neuron's exact fixed line is tighter than any
-                    // relaxation and must stand). Clamped to [0, 1], so every
-                    // seeded line is a valid DeepPoly lower relaxation; `ms`
-                    // is derived AFTER this from the seeded values, and
-                    // `apply_gates` takes its fractional-alpha widening branch
-                    // for every non-binary row. Shape/finiteness mismatches
-                    // fail open to the heuristic (never an error: a stale
-                    // seed costs tightness, not soundness).
+                    // #rebake: seed unstable lower slopes, preserving stable
+                    // fixed lines. Derive ms after seeding; the Outward gate
+                    // transform charges both binary and fractional slopes.
+                    // Invalid seeds retain the area heuristic.
                     if let Some(seed) = alpha_seed {
                         if let Some(sa) = seed.get(layers.len()) {
                             if sa.len() == n {
@@ -2035,11 +2313,20 @@ impl RootGates {
                             scored.truncate(cfg.per_layer);
                             // Ascending neuron index for cache-friendly reads.
                             scored.sort_by_key(|&(_, j, _)| j);
-                            let msrc = mi.as_slice().expect("standard layout");
-                            let dsrc = di.as_slice().expect("standard layout");
                             for &(_, j, pos) in &scored {
-                                let mrow = &msrc[j * naug..(j + 1) * naug];
-                                let drow = &dsrc[j * naug..(j + 1) * naug];
+                                let owned;
+                                let (mrow, drow) = match &rows {
+                                    sparse_stem::ReluRows::Dense(mi, di) => (
+                                        &mi.as_slice().expect("standard layout")
+                                            [j * naug..(j + 1) * naug],
+                                        &di.as_slice().expect("standard layout")
+                                            [j * naug..(j + 1) * naug],
+                                    ),
+                                    sparse_stem::ReluRows::Packed(rows) => {
+                                        owned = rows.row(j);
+                                        (owned.0.as_slice(), owned.1.as_slice())
+                                    }
+                                };
                                 layer_ret.idx.push(j);
                                 layer_ret.unst_pos.push(pos);
                                 // RANKER-ONLY rows; nearest f32 is fine in both
@@ -2054,25 +2341,20 @@ impl RootGates {
                         }
                         ret.layers.push(layer_ret);
                     }
-                    // #clip-rows: retain the INPUT-RELATIVE affine rows for the
-                    // unstable neurons. `mi`/`di` are (n, n_in) and are exactly
-                    // what `concretize_box` just consumed to produce `l`/`u`, so
-                    // the frame is established by construction here rather than
-                    // asserted later. Only `unst` rows are kept: a split can only
-                    // constrain an unstable neuron, and keeping all of them would
-                    // be (n x n_in) f64 per trunk layer.
-                    // Calibration frame (#backward-interm, #mr-ibp-seed): the
-                    // FORWARD-only bounds when a tightener was live (see
-                    // `bi_cal` above), otherwise the published ones — which
-                    // then ARE the forward bounds, so the historical behavior
-                    // is bit-identical.
+                    // #clip-rows: retain unstable neurons' input-relative rows
+                    // from mi/di, each (n, n_in + 1) including bias. Use the
+                    // forward-only calibration snapshot when present (bi_cal),
+                    // otherwise the identical published bounds.
                     let clip_rows = clip_rows_enabled().then(|| {
                         let (l_cal, u_cal) = bi_cal
                             .as_ref()
                             .map_or((l.as_slice(), u.as_slice()), |(lc, uc)| {
                                 (lc.as_slice(), uc.as_slice())
                             });
-                        retain_clip_rows(&mi, &di, &unst, &mid, &rad, l_cal, u_cal)
+                        let sparse_stem::ReluRows::Dense(mi, di) = &rows else {
+                            unreachable!("packed admission excludes ClipRows")
+                        };
+                        retain_clip_rows(mi, di, &unst, &mid, &rad, l_cal, u_cal)
                     });
                     layers.push(LayerGates {
                         op: k,
@@ -2091,6 +2373,9 @@ impl RootGates {
                         if timing {
                             op_times.push((k, "relu", n, op_t0.elapsed().as_secs_f64()));
                         }
+                        if let Some(progress) = progress.as_mut() {
+                            progress.end_op(("no_tableau", 0));
+                        }
                         break; // downstream tableau unused beyond retention
                     }
                     // Apply gates: L = (M-D)*alpha; U = (M+D)*s + c@bias.
@@ -2101,18 +2386,39 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    let (mo, do_, gstore) = apply_gates(
-                        &mi,
-                        &di,
-                        &alpha,
-                        &s,
-                        &c,
-                        n_in,
-                        mode,
-                        if use_mask { Some(&smask_in) } else { None },
-                        blk,
-                        &xabs_ext,
-                    );
+                    // Retention has copied its selected rows. Apply gates to
+                    // the dense or packed carrier; the owned dense route can
+                    // reuse its arrays.
+                    let (rows, gstore) = match rows {
+                        sparse_stem::ReluRows::Dense(mi, di) => {
+                            let (mo, do_, gstore) = apply_gates_owned(
+                                mi,
+                                di,
+                                &alpha,
+                                &s,
+                                &c,
+                                n_in,
+                                mode,
+                                if use_mask { Some(&smask_in) } else { None },
+                                blk,
+                                &xabs_ext,
+                            );
+                            (sparse_stem::ReluRows::Dense(mo, do_), gstore)
+                        }
+                        sparse_stem::ReluRows::Packed(mut rows) => {
+                            let gstore = rows.apply_gates(&alpha, &s, &c, &xabs_ext, deadline)?;
+                            (sparse_stem::ReluRows::Packed(rows), gstore)
+                        }
+                    };
+                    if timing
+                        && owned_gates_enabled(mode)
+                        && matches!(&rows, sparse_stem::ReluRows::Dense(..))
+                    {
+                        eprintln!(
+                            "[root-owned-gates] applied: rows={n} reused_tableau_bytes={}",
+                            2 * n as u128 * naug as u128 * size_of::<T>() as u128
+                        );
+                    }
                     // Propagate the f32 error through the gate transform by the
                     // certified contraction `max(alpha_j, s_j)` — see
                     // [`gate_gerr_out`] for the derivation and for why the
@@ -2135,7 +2441,11 @@ impl RootGates {
                     } else {
                         Vec::new()
                     };
-                    state[k + 1] = Some((mo, do_, gerr_out, smask_out));
+                    state[k + 1] = Some(sparse_stem::State {
+                        rows,
+                        gerr: gerr_out,
+                        support: smask_out,
+                    });
                     completed_store_ops += 1;
                 }
                 TwinOp::Gemm { .. } => unreachable!("guarded above"),
@@ -2150,6 +2460,9 @@ impl RootGates {
                     TwinOp::Gemm { .. } => "gemm",
                 };
                 op_times.push((k, kind, net.tsize[k + 1], op_t0.elapsed().as_secs_f64()));
+            }
+            if let Some(progress) = progress.as_mut() {
+                progress.end_op(root_progress_layout(&state[k + 1]));
             }
         }
         if timing {
@@ -2193,7 +2506,7 @@ impl RootGates {
             completed_conv_ops,
             completed_store_ops,
         );
-        Ok((
+        let result = (
             Self {
                 mode,
                 mid,
@@ -2215,7 +2528,11 @@ impl RootGates {
                 head_group_source: None,
             },
             retained,
-        ))
+        );
+        if let Some(progress) = progress.as_mut() {
+            progress.finish();
+        }
+        Ok(result)
     }
 }
 
@@ -2320,6 +2637,137 @@ pub(crate) fn retain_clip_rows<T: TabElem>(
         sl_up,
         bm,
         bd,
+    }
+}
+
+// Streaming diagnostics are opt-in under NY_MARGIN_ROW_ROOT_TIMING. They
+// identify the active operation even when an inner helper returns early or a
+// hard stop prevents the buffered summary from being printed. These events
+// describe one tableau walk, not a verification result or flight acceptance.
+struct RootProgress {
+    pid: u32,
+    attempt: u64,
+    started: Instant,
+    active: Option<ActiveRootOp>,
+    completed_ops: usize,
+    finished: bool,
+}
+
+struct ActiveRootOp {
+    index: usize,
+    kind: &'static str,
+    rows: usize,
+    started: Instant,
+}
+
+fn root_progress_layout<T>(state: &Option<sparse_stem::State<T>>) -> (&'static str, usize) {
+    match state.as_ref().map(|state| &state.rows) {
+        Some(sparse_stem::ReluRows::Dense(m, _)) => ("dense", m.ncols()),
+        Some(sparse_stem::ReluRows::Packed(rows)) => ("packed", rows.m.ncols()),
+        None => ("no_tableau", 0),
+    }
+}
+
+impl RootProgress {
+    fn new(n_in: usize, use_f32: bool, tableau_f32: bool, outward: bool) -> Self {
+        static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let progress = Self {
+            pid: std::process::id(),
+            attempt: NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            started: Instant::now(),
+            active: None,
+            completed_ops: 0,
+            finished: false,
+        };
+        progress.emit(
+            "attempt_begin",
+            format_args!(
+                "n_in={n_in} use_f32={use_f32} tableau_f32={tableau_f32} outward={outward}"
+            ),
+        );
+        progress
+    }
+
+    fn emit(&self, event: &str, details: std::fmt::Arguments<'_>) {
+        use std::io::Write;
+        // Diagnostics must not turn an existing error/unwind into a new panic.
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "[root-progress] v=1 pid={} attempt={} event={} {}",
+            self.pid, self.attempt, event, details
+        );
+        let _ = stderr.flush();
+    }
+
+    fn begin_op(&mut self, index: usize, kind: &'static str, rows: usize, started: Instant) {
+        self.active = Some(ActiveRootOp {
+            index,
+            kind,
+            rows,
+            started,
+        });
+        self.emit(
+            "op_begin",
+            format_args!("op={index} kind={kind} rows={rows}"),
+        );
+    }
+
+    fn end_op(&mut self, (layout, columns): (&str, usize)) {
+        if let Some(op) = self.active.take() {
+            self.completed_ops += 1;
+            self.emit(
+                "op_end",
+                format_args!(
+                    "op={} kind={} rows={} layout={} columns={} seconds={:.6}",
+                    op.index,
+                    op.kind,
+                    op.rows,
+                    layout,
+                    columns,
+                    op.started.elapsed().as_secs_f64()
+                ),
+            );
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.emit(
+            "attempt_complete",
+            format_args!(
+                "completed_ops={} seconds={:.6}",
+                self.completed_ops,
+                self.started.elapsed().as_secs_f64()
+            ),
+        );
+    }
+}
+
+impl Drop for RootProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Some(op) = self.active.take() {
+                self.emit(
+                    "op_abort",
+                    format_args!(
+                        "op={} kind={} rows={} seconds={:.6}",
+                        op.index,
+                        op.kind,
+                        op.rows,
+                        op.started.elapsed().as_secs_f64()
+                    ),
+                );
+            }
+            self.emit(
+                "attempt_abort",
+                format_args!(
+                    "completed_ops={} seconds={:.6}",
+                    self.completed_ops,
+                    self.started.elapsed().as_secs_f64()
+                ),
+            );
+        }
     }
 }
 
@@ -2919,6 +3367,19 @@ fn add_op_signsafe<T: TabElem>(
                     let lo = (b * bw).min(n_in);
                     let hi = (lo + bw).min(n_in);
                     for i in lo..hi {
+                        // Exact +0 + +0 needs no coefficient storage debt.
+                        // Preserve signed zero, subnormals and nonzero signed D;
+                        // the bias and original-frame row charge still run.
+                        if T::F32_STORE
+                            && mrow[i].is_positive_zero()
+                            && mbr[i].is_positive_zero()
+                            && drow[i].is_positive_zero()
+                            && dbr[i].is_positive_zero()
+                            && xabs_ext[i].is_finite()
+                            && xabs_ext[i] >= 0.0
+                        {
+                            continue;
+                        }
                         let sum = mrow[i].wide() + mbr[i].wide();
                         let dsum = drow[i].wide() + dbr[i].wide();
                         racc += (sum.abs() + dsum.abs()) * xabs_ext[i];
@@ -2970,15 +3431,48 @@ fn apply_gates_signsafe<T: TabElem>(
 ) -> (Array2<T>, Array2<T>, Vec<f64>) {
     let naug = n_in + 1;
     let n = m.nrows();
-    let mut mo = Array2::<T>::from_elem((n, naug), T::ZERO);
-    let mut do_ = Array2::<T>::from_elem((n, naug), T::ZERO);
+    let mo = Array2::<T>::from_elem((n, naug), T::ZERO);
+    let do_ = Array2::<T>::from_elem((n, naug), T::ZERO);
+    apply_gates_signsafe_into::<T, false>(
+        m.as_slice().expect("standard layout"),
+        d.as_slice().expect("standard layout"),
+        mo,
+        do_,
+        alpha,
+        s,
+        c,
+        n_in,
+        smask,
+        blk,
+        xabs_ext,
+    )
+}
+
+/// One arithmetic body for borrowed and owned sources. Each coefficient uses
+/// only its own input pair; both values are read before either output is
+/// written. The bias is read last, after the unchanged ordered row reductions.
+/// `IN_PLACE` changes ownership and loads, never the rounding/error formulas.
+#[allow(clippy::too_many_arguments)]
+fn apply_gates_signsafe_into<T: TabElem, const IN_PLACE: bool>(
+    msrc: &[T],
+    dsrc: &[T],
+    mut mo: Array2<T>,
+    mut do_: Array2<T>,
+    alpha: &[f64],
+    s: &[f64],
+    c: &[f64],
+    n_in: usize,
+    smask: Option<&[u64]>,
+    blk: usize,
+    xabs_ext: &[f64],
+) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    let naug = n_in + 1;
+    let n = mo.nrows();
     let mut gstore = vec![0.0f64; n];
     let acc_widen = 1.0 + 2.0 * gamma_n(naug + 8);
     let rwiden = root_round_widen(naug);
     let floor = root_round_floor(xabs_ext);
     let (nblk, bw) = coef_blocks(smask.is_some(), n_in, blk);
-    let msrc = m.as_slice().expect("standard layout");
-    let dsrc = d.as_slice().expect("standard layout");
     let mdst = mo.as_slice_mut().expect("standard layout");
     let ddst = do_.as_slice_mut().expect("standard layout");
     mdst.par_chunks_mut(naug)
@@ -2988,22 +3482,58 @@ fn apply_gates_signsafe<T: TabElem>(
         .for_each(|(j, ((mrow, drow), gs))| {
             let a_j = alpha[j];
             let s_j = s[j];
-            let msr = &msrc[j * naug..(j + 1) * naug];
-            let dsr = &dsrc[j * naug..(j + 1) * naug];
-            // Outside the mask `m == d == 0.0`, so both outputs are EXACTLY
-            // zero, which the freshly zeroed `mo`/`do_` already hold.
+            let exact_zero_coefficients = T::F32_STORE && a_j.is_finite() && s_j.is_finite();
+            let (msr, dsr) = if IN_PLACE {
+                (&[][..], &[][..])
+            } else {
+                (
+                    &msrc[j * naug..(j + 1) * naug],
+                    &dsrc[j * naug..(j + 1) * naug],
+                )
+            };
+            // Outside support the root's input/Conv allocations are raw +0;
+            // Add unions masks, and affine/Flatten/ReLU preserve that storage.
+            // Both paths therefore already hold +0 in every skipped block.
             let mask = smask.map_or(u64::MAX, |sm| sm[j]);
             let mut racc = 0.0f64;
             let mut dust = 0.0f64;
             for b in 0..nblk {
-                if !support_has(mask, b) {
-                    continue;
-                }
                 let lo = (b * bw).min(n_in);
                 let hi = (lo + bw).min(n_in);
+                if !support_has(mask, b) {
+                    #[cfg(test)]
+                    if IN_PLACE {
+                        // Pin the production ownership/support contract without
+                        // scanning or touching skipped pages in the real walk.
+                        assert!(mrow[lo..hi]
+                            .iter()
+                            .chain(&drow[lo..hi])
+                            .all(|&v| v.is_positive_zero()));
+                    }
+                    continue;
+                }
                 for i in lo..hi {
-                    let lo_c = (msr[i].wide() - dsr[i].wide()) * a_j;
-                    let up_c = (msr[i].wide() + dsr[i].wide()) * s_j;
+                    let (mi_raw, di_raw) = if IN_PLACE {
+                        (mrow[i], drow[i])
+                    } else {
+                        (msr[i], dsr[i])
+                    };
+                    // For f32 storage, a raw +0 pair and finite slopes give
+                    // exact real L=U=0, so leave the stored zero pair unchanged.
+                    // Raw-bit checks exclude -0 and nonzero subnormals; invalid
+                    // magnitudes retain ordinary arithmetic/refusal. The bias
+                    // always takes the full charge path below.
+                    if exact_zero_coefficients
+                        && mi_raw.is_positive_zero()
+                        && di_raw.is_positive_zero()
+                        && xabs_ext[i].is_finite()
+                        && xabs_ext[i] >= 0.0
+                    {
+                        continue;
+                    }
+                    let (mi, di) = (mi_raw.wide(), di_raw.wide());
+                    let lo_c = (mi - di) * a_j;
+                    let up_c = (mi + di) * s_j;
                     #[allow(clippy::manual_midpoint)]
                     let mm = (lo_c + up_c) * 0.5;
                     let dd = (up_c - lo_c) * 0.5;
@@ -3018,8 +3548,13 @@ fn apply_gates_signsafe<T: TabElem>(
                 }
             }
             // Bias column, last: the intercept, then the whole row's charge.
-            let lo_c = (msr[n_in].wide() - dsr[n_in].wide()) * a_j;
-            let up0 = (msr[n_in].wide() + dsr[n_in].wide()) * s_j;
+            let (mi, di) = if IN_PLACE {
+                (mrow[n_in].wide(), drow[n_in].wide())
+            } else {
+                (msr[n_in].wide(), dsr[n_in].wide())
+            };
+            let lo_c = (mi - di) * a_j;
+            let up0 = (mi + di) * s_j;
             let up_c = up0 + c[j];
             #[allow(clippy::manual_midpoint)]
             let mm = (lo_c + up_c) * 0.5;
@@ -3036,6 +3571,73 @@ fn apply_gates_signsafe<T: TabElem>(
             }
         });
     (mo, do_, gstore)
+}
+
+/// The root owns its preactivation arrays after `take` and has already copied
+/// retention products. Outward gates can therefore overwrite each site after
+/// reading it. The root also maintains raw +0 outside support; those sites stay
+/// untouched. Parity and the test-only historical charge keep their old path.
+#[allow(clippy::too_many_arguments)]
+fn apply_gates_owned<T: TabElem>(
+    m: Array2<T>,
+    d: Array2<T>,
+    alpha: &[f64],
+    s: &[f64],
+    c: &[f64],
+    n_in: usize,
+    mode: RoundMode,
+    smask: Option<&[u64]>,
+    blk: usize,
+    xabs_ext: &[f64],
+) -> (Array2<T>, Array2<T>, Vec<f64>) {
+    if owned_gates_enabled(mode) {
+        apply_gates_signsafe_into::<T, true>(
+            &[],
+            &[],
+            m,
+            d,
+            alpha,
+            s,
+            c,
+            n_in,
+            smask,
+            blk,
+            xabs_ext,
+        )
+    } else {
+        apply_gates(&m, &d, alpha, s, c, n_in, mode, smask, blk, xabs_ext)
+    }
+}
+
+fn owned_gates_enabled(mode: RoundMode) -> bool {
+    mode.outward() && !legacy_rounding_forced() && !borrowed_gates_forced()
+}
+
+#[cfg(not(test))]
+const fn borrowed_gates_forced() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static BORROWED_GATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn borrowed_gates_forced() -> bool {
+    BORROWED_GATES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn with_borrowed_gates_for_test<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BORROWED_GATES.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(BORROWED_GATES.with(|slot| slot.replace(true)));
+    f()
 }
 
 // --------------------------------------------------------------------------
@@ -3730,21 +4332,41 @@ pub(crate) fn conv_f32_gerr<T: TabElem>(
             }
             // Bias column (index n_in): xabs_ext weight = 1.
             braw += mrow[n_in].wide().abs() + dmag(drow[n_in].wide());
-            let b_up = next_up(braw * (1.0 + bwiden));
-            *gt = if store_dust {
+            if store_dust {
                 braw_d += dmag(drow[n_in].wide());
-                let bd_up = next_up(braw_d * (1.0 + bwiden));
-                next_up(
-                    gerr_in[t] + gf32 * b_up + 8.0 * UNIT_F32 * bd_up + F32_MIN_POSITIVE * s_xabs,
-                )
-            } else {
-                next_up(gerr_in[t] + gf32 * b_up)
-            };
+            }
+            *gt = conv_f32_ginp_value(gerr_in[t], braw, braw_d, gf32, bwiden, s_xabs, store_dust);
         });
+    let gout = conv_f32_gerr_finish(c, &ginp, s_xabs, store_dust);
+    exceptional_conv::correct(c, mi, din, &ginp, xabs, n_in, gout)
+}
+
+// Magnitude charge for an ordinary f32 Conv. Preserve the expression order,
+// including next_up(0), storage dust, and the original f64 weight convolution.
+#[inline]
+fn conv_f32_ginp_value(
+    gerr_in: f64,
+    braw: f64,
+    braw_d: f64,
+    gf32: f64,
+    bwiden: f64,
+    s_xabs: f64,
+    store_dust: bool,
+) -> f64 {
+    let b_up = next_up(braw * (1.0 + bwiden));
+    if store_dust {
+        let bd_up = next_up(braw_d * (1.0 + bwiden));
+        next_up(gerr_in + gf32 * b_up + 8.0 * UNIT_F32 * bd_up + F32_MIN_POSITIVE * s_xabs)
+    } else {
+        next_up(gerr_in + gf32 * b_up)
+    }
+}
+
+fn conv_f32_gerr_finish(c: &ConvOp, ginp: &Array2<f64>, s_xabs: f64, store_dust: bool) -> Vec<f64> {
     // g_err_out = |W| (gather) @ ginp  — a single-column forward conv_abs (f64).
     let n_out = c.oshape.0 * c.oshape.1 * c.oshape.2;
     let mut gout = Array2::<f64>::zeros((n_out, 1));
-    conv_apply_forward(c, &ginp, &mut gout, true);
+    conv_apply_forward(c, ginp, &mut gout, true);
     // Widen for the vector conv's own f64 rounding, then add the per-output f32
     // subnormal/FTZ absolute floor (M and D lanes each <= (k_fwd+2)*2^-149 per
     // output coefficient; summed over i weighted by xabs_ext gives *S).
@@ -4005,7 +4627,7 @@ mod extreme_gate_tests;
 /// Gate application on the tableau (Python parity):
 /// `L = (M-D)*alpha; U = (M+D)*s; U_bias += c; M' = (L+U)/2; D' = (U-L)/2`.
 ///
-/// OUTWARD (#root-rounding, the shipped path, `apply_gates_signsafe`). The
+/// OUTWARD (#root-rounding, shared `apply_gates_signsafe_into` body). The
 /// obligation is FUNCTIONAL, not per coefficient: for every `x~ = (x, 1)` with
 /// `|x_i| <= xabs_i`,
 ///

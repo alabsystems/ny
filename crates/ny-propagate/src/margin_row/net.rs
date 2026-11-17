@@ -1150,7 +1150,38 @@ pub(crate) fn conv_forward_f32_native(
     );
 }
 
-/// Column blocking shared by both f32 conv entries.
+/// Deadline-aware native f32 contraction. On error the caller must discard
+/// dst: joined workers may have stored complete independent column tiles.
+pub(crate) fn conv_forward_f32_native_checked(
+    c: &ConvOp,
+    src: &Array2<f32>,
+    dst: &mut Array2<f32>,
+    abs_w: bool,
+    mask: Option<(&[u64], &[u64], usize)>,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    if deadline.is_none() {
+        conv_forward_f32_native(c, src, dst, abs_w, mask);
+        return Ok(());
+    }
+    check_contraction_deadline::<true, false>(deadline, None)?;
+    let r = src.ncols();
+    let (blk, nblk) = conv_f32_blocking(mask, r, c.kernel.0);
+    conv_f32_core_checked::<f32, true, false>(
+        c,
+        src.as_slice().expect("standard layout"),
+        r,
+        dst,
+        abs_w,
+        mask.map(|(_, out, _)| out),
+        blk,
+        nblk,
+        deadline,
+        None,
+    )
+}
+
+/// Shared column blocking for the f32 convolution paths.
 ///
 /// #tableau-support-mask: the column blocking is driven by the mask when one
 /// is supplied (so a block is either wholly computed or wholly skipped), and
@@ -1189,10 +1220,8 @@ impl ConvF32Dst for f32 {
     }
 }
 
-/// Shared spatial/tap loop of the f32 forward conv (see
-/// [`conv_forward_blocked_f32`] for the algorithm and soundness notes). Moved
-/// VERBATIM out of the former monolith so the f32-store lane cannot drift from
-/// the shipped f32-compute lane.
+/// Shared spatial/tap loop. Both storage lanes use the same per-coefficient
+/// arithmetic; the untimed specialization eliminates deadline polling.
 #[allow(clippy::too_many_arguments)]
 fn conv_f32_core<O: ConvF32Dst>(
     c: &ConvOp,
@@ -1204,6 +1233,30 @@ fn conv_f32_core<O: ConvF32Dst>(
     blk: usize,
     nblk: usize,
 ) {
+    conv_f32_core_checked::<O, false, false>(
+        c, src32, r, dst, abs_w, out_mask, blk, nblk, None, None,
+    )
+    .expect("untimed forward contraction cannot expire");
+}
+
+// A work bound between cooperative polls, not a wall-time guarantee.
+const FORWARD_POLL_SCALARS: usize = 16 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+fn conv_f32_core_checked<O: ConvF32Dst, const TIMED: bool, const COOPERATIVE: bool>(
+    c: &ConvOp,
+    src32: &[f32],
+    r: usize,
+    dst: &mut Array2<O>,
+    abs_w: bool,
+    out_mask: Option<&[u64]>,
+    blk: usize,
+    nblk: usize,
+    deadline: Option<Instant>,
+    checkpoint: Option<&(dyn Fn() -> Result<()> + Sync)>,
+) -> Result<()> {
+    let poll = || check_contraction_deadline::<TIMED, COOPERATIVE>(deadline, checkpoint);
+    poll()?;
     let (co, _, _, _) = c.kernel;
     let p = c.oshape.1 * c.oshape.2;
     let k = c.k_fwd;
@@ -1211,11 +1264,23 @@ fn conv_f32_core<O: ConvF32Dst>(
     debug_assert_eq!(dst.ncols(), r);
     debug_assert_eq!(src32.len() % r.max(1), 0);
     // f32 weights (small, cached in registers/L1). |w| for the abs (D) lane.
-    let w32: Vec<f32> = if abs_w {
-        c.wmat.iter().map(|&w| (w as f32).abs()).collect()
+    let mut w32 = Vec::with_capacity(c.wmat.len());
+    for (i, &w) in c.wmat.iter().enumerate() {
+        if TIMED && i % FORWARD_POLL_SCALARS == 0 {
+            poll()?;
+        }
+        w32.push(if abs_w { (w as f32).abs() } else { w as f32 });
+    }
+    poll()?;
+    let tile = if TIMED {
+        blk.min(FORWARD_POLL_SCALARS)
     } else {
-        c.wmat.iter().map(|&w| w as f32).collect()
-    };
+        blk
+    }
+    .max(1);
+    let nacc = co
+        .checked_mul(tile)
+        .ok_or_else(|| NyError::InvalidSpec("forward convolution scratch overflow".into()))?;
     let mut dst3 = dst
         .view_mut()
         .into_shape_with_order((co, p, r))
@@ -1224,49 +1289,83 @@ fn conv_f32_core<O: ConvF32Dst>(
         .into_par_iter()
         .with_min_len(par_min_len(co * blk, p))
         .enumerate()
-        .for_each_init(
-            || vec![0.0f32; co * blk],
-            |acc, (sp, mut out_sp)| {
-                // All output channels at one spatial position gather the same
-                // source rows, so row `sp` (channel 0) carries the whole
-                // position's mask. `nblk == SUPPORT_BLOCKS <= 64` exactly when a
-                // mask is present, so the shift below is always in range.
-                for b in 0..nblk {
-                    if out_mask.is_some_and(|om| om[sp] & (1u64 << b) == 0) {
-                        continue;
+        .try_for_each_init(Vec::<f32>::new, |acc, (sp, mut out_sp)| -> Result<()> {
+            poll()?;
+            if acc.len() < nacc {
+                acc.try_reserve_exact(nacc - acc.len()).map_err(|_| {
+                    NyError::InternalError("forward convolution scratch allocation failed".into())
+                })?;
+                while acc.len() < nacc {
+                    poll()?;
+                    let chunk = if TIMED { FORWARD_POLL_SCALARS } else { nacc };
+                    acc.resize(acc.len() + (nacc - acc.len()).min(chunk), 0.0);
+                }
+            }
+            // All output channels at one spatial position gather the same
+            // source rows, so row `sp` (channel 0) carries the whole
+            // position's mask. `nblk == SUPPORT_BLOCKS <= 64` exactly when a
+            // mask is present, so the shift below is always in range.
+            for b in 0..nblk {
+                poll()?;
+                if out_mask.is_some_and(|om| om[sp] & (1u64 << b) == 0) {
+                    continue;
+                }
+                let start = (b * blk).min(r);
+                let end = start + (r - start).min(blk);
+                // Subdivide within the original support block. Changing
+                // blk/nblk would reinterpret the caller's support bits.
+                for rc in (start..end).step_by(tile) {
+                    poll()?;
+                    let rb = (end - rc).min(tile);
+                    let work_tile = if TIMED {
+                        FORWARD_POLL_SCALARS
+                    } else {
+                        (co * rb).max(1)
+                    };
+                    for part in acc[..co * rb].chunks_mut(work_tile) {
+                        poll()?;
+                        part.fill(0.0);
                     }
-                    let rc = (b * blk).min(r);
-                    let rb = (r - rc).min(blk);
-                    if rb == 0 {
-                        continue;
-                    }
-                    for v in acc[..co * rb].iter_mut() {
-                        *v = 0.0;
-                    }
+                    let channels = if TIMED {
+                        (FORWARD_POLL_SCALARS / rb).max(1)
+                    } else {
+                        co.max(1)
+                    };
                     for t in 0..k {
+                        poll()?;
                         let gi = c.gather[t * p + sp];
                         if gi == usize::MAX {
                             continue;
                         }
                         let srow = &src32[gi * r + rc..gi * r + rc + rb];
-                        for oc in 0..co {
-                            let w = w32[oc * k + t];
-                            if w == 0.0 {
-                                continue;
+                        for oc0 in (0..co).step_by(channels) {
+                            poll()?;
+                            for oc in oc0..(oc0 + channels).min(co) {
+                                let w = w32[oc * k + t];
+                                if w == 0.0 {
+                                    continue;
+                                }
+                                axpy_f32(&mut acc[oc * rb..oc * rb + rb], w, srow);
                             }
-                            axpy_f32(&mut acc[oc * rb..oc * rb + rb], w, srow);
                         }
                     }
-                    for oc in 0..co {
-                        let mut arow = out_sp.row_mut(oc);
-                        let dr = arow.as_slice_mut().expect("contiguous output row");
-                        for (d, &a) in dr[rc..rc + rb].iter_mut().zip(&acc[oc * rb..oc * rb + rb]) {
-                            *d = O::from_acc(a);
+                    for oc0 in (0..co).step_by(channels) {
+                        poll()?;
+                        for oc in oc0..(oc0 + channels).min(co) {
+                            let mut arow = out_sp.row_mut(oc);
+                            let dr = arow.as_slice_mut().expect("contiguous output row");
+                            for (d, &a) in
+                                dr[rc..rc + rb].iter_mut().zip(&acc[oc * rb..oc * rb + rb])
+                            {
+                                *d = O::from_acc(a);
+                            }
                         }
                     }
                 }
-            },
-        );
+            }
+            poll()
+        })?;
+    poll()
 }
 
 /// `acc += w * src` over contiguous f32 slices (autovectorized, non-fused).
@@ -2614,6 +2713,10 @@ pub(super) fn axpy_with_deadline(
 #[cfg(test)]
 #[path = "net_deadline_tests.rs"]
 mod deadline_tests;
+
+#[cfg(test)]
+#[path = "net_forward_deadline_tests.rs"]
+mod forward_deadline_tests;
 
 #[cfg(test)]
 #[path = "errconv_screen_tests.rs"]

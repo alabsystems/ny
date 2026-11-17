@@ -352,7 +352,8 @@ pub(crate) enum BenchmarkAssetsAction {
         ny_ce_source: Option<String>,
 
         /// Check solved rows against this year's official per-instance timeouts
-        /// (repeatable); rows over budget are reported and not scored
+        /// (repeatable). For 2026 official fields, subtract each tool's startup
+        /// minimum from its complete TOOL/results.csv; NY uses actual wall time
         #[arg(long = "budget-year")]
         budget_years: Vec<u32>,
     },

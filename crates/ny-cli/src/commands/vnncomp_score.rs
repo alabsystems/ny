@@ -20,16 +20,16 @@
 //! checks. Tolerant acceptance credits its own SAT without convicting UNSAT;
 //! only a strict witness does both. Unevidenced SAT claims receive no credit.
 //! Source/build eligibility and cross-version equivalence remain separate gates.
+//! With `--year 2026 --budget-year 2026`, field verdicts also apply the pinned
+//! organizer's global per-tool startup subtraction before the timeout check.
+//! NY's measured wall time keeps its separate strict original-budget check.
 //!
 //! # Budget enforcement
 //!
-//! `--budget-year` loads the official per-instance timeouts from that corpus's
-//! `instances.csv` files and re-checks every solved row's recorded runtime
-//! against its own budget. This is not a formality: VNN-COMP timeouts are
-//! **per instance**, not per benchmark, and nn4sys alone spans 20 s to 800 s.
-//! A solved row recorded above its budget is a *phantom point* — the real
-//! harness kills it at the timeout and awards zero — so such rows are reported
-//! and EXCLUDED from the modeled score rather than silently banked as progress.
+//! `--budget-year` loads per-instance timeouts from the corpus's `instances.csv`
+//! files. Budgets vary within categories: nn4sys alone spans 20 s to 800 s.
+//! NY uses recorded wall time; normalized 2026 field rows use startup-adjusted
+//! time. Solves above the applicable budget receive zero modeled credit.
 //!
 //! Coverage is reported alongside the violations. A row whose identity has no
 //! budget in the supplied corpora is counted as unchecked, never as passing;
@@ -47,6 +47,9 @@ use super::vnncomp_2026_tracks::{EXTENDED_TRACK_2026, REGULAR_TRACK_2026};
 use super::vnncomp_reseed::model_identity_entries;
 use super::vnncomp_sweep::parse_instances;
 
+#[path = "vnncomp_score_field_timeouts.rs"]
+mod field_timeouts;
+
 const POINTS_CORRECT: i64 = 10;
 const PENALTY_INCORRECT: i64 = -150;
 const MODELED_SCORE_CAVEAT: &str = "raw CSV: SAT witnesses are assumed valid and are not \
@@ -56,6 +59,10 @@ const MODELED_2026_SCORE_CAVEAT: &str = "local projection: published per-run cou
 checks are used only in adjudicated mode; unevidenced SAT claims are unqualified. Source/build \
 eligibility, corpus pins, organizer field timeout normalization and cross-version positional \
 checks are not established";
+const NORMALIZED_2026_SCORE_CAVEAT: &str = "local projection: supplied aggregate field rows \
+apply the pinned 2026 per-tool startup/timeout policy; published per-run counterexample checks \
+are used only in adjudicated mode. Source/build eligibility, complete corpus provenance and \
+cross-version positional equivalence are not established";
 const UNCHECKED_BUDGET_CAVEAT: &str =
     "recorded runtimes are NOT checked against official per-instance budgets; pass \
 --budget-year to enforce them";
@@ -91,8 +98,6 @@ impl ScoreYear {
 }
 
 /// How SAT rows in a raw results CSV are treated when scoring.
-///
-/// This choice moves the answer by more than 100 points, so it is explicit.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Witnesses {
@@ -207,7 +212,7 @@ struct InstanceKey {
     benchmark: String,
     onnx: String,
     vnnlib: String,
-    /// Zero-based occurrence among identical rows in one result file.
+    /// Zero-based occurrence of a repeated instance key in one result file.
     ///
     /// Some official instance banks intentionally repeat the same model/spec
     /// pair. The repetitions are separately scored and must not be overwritten.
@@ -290,13 +295,11 @@ impl InstanceKey {
         )
     }
 
-    /// Identity as the organisers' scoring log writes it: `<model-stem>` and
+    /// Identity in historical organiser scoring logs: `<model-stem>` and
     /// `<property-stem>` joined by `-`, with directories and extensions dropped.
     ///
-    /// `None` for relational instances, whose model field holds several paths
-    /// encoded as JSON and therefore has no single stem. The log does not name
-    /// them this way either, so no truth is claimed for them rather than a
-    /// wrong one being manufactured.
+    /// Relational instances hold an ordered named-model list, with no single
+    /// stem; return `None` rather than inventing a log identity.
     fn ground_truth_key(&self) -> Option<GroundTruthKey> {
         if self.onnx.starts_with('[') {
             return None;
@@ -1639,6 +1642,8 @@ pub(crate) struct ProgressReport {
     pub(crate) score_track: Option<ScoreTrack>,
     /// Present whenever `--official` requested a modeled raw-CSV scoreboard.
     pub(crate) modeled_score_caveat: Option<&'static str>,
+    /// Applied only with the explicit 2026 field and original-budget corpus.
+    pub(crate) field_timeout_normalization: Option<field_timeouts::FieldTimeoutNormalization>,
     /// Present when no `--budget-year` was supplied, so runtimes went unchecked.
     pub(crate) unchecked_budget_caveat: Option<&'static str>,
     /// Decided current rows withheld from scoring across all benchmarks.
@@ -2017,6 +2022,7 @@ fn modeled_official_score(
     benchmark: &str,
     current: &ResultRows,
     field: &OfficialField,
+    original_cohort: Option<&BTreeSet<InstanceKey>>,
     year: ScoreYear,
     track: ScoreTrack,
     over_budget: &BTreeSet<InstanceKey>,
@@ -2026,13 +2032,33 @@ fn modeled_official_score(
     if !track.includes(year, benchmark) {
         return None;
     }
-    let scored_instances = field
-        .values()
-        .flat_map(|rows| rows.keys())
-        .filter(|key| key.benchmark == benchmark)
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let scored_instances = match original_cohort {
+        Some(keys) => keys
+            .iter()
+            .filter(|key| key.benchmark == benchmark)
+            .cloned()
+            .collect(),
+        None => field
+            .values()
+            .flat_map(|rows| rows.keys())
+            .filter(|key| key.benchmark == benchmark)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+    };
     if scored_instances.is_empty() {
+        return None;
+    }
+    // Removing inactive incumbent participants must not remove their original
+    // eligible rows: an in-budget NY decision can be the sole new participant.
+    // A row outside that supplied cohort cannot invent a scored category.
+    if original_cohort.is_some()
+        && !field
+            .values()
+            .any(|rows| rows.keys().any(|key| key.benchmark == benchmark))
+        && !current.iter().any(|(key, entry)| {
+            scored_instances.contains(key) && entry.verdict.solved() && !over_budget.contains(key)
+        })
+    {
         return None;
     }
 
@@ -2051,8 +2077,7 @@ fn modeled_official_score(
         )
     };
     let current_score = score_rows(current, &scored_instances, &adjudication, over_budget);
-    // This projection retains supplied field verdicts. Replaying the organizer's
-    // startup-overhead timeout normalization remains a separate admission gate.
+    // Field verdicts include any explicitly requested 2026 timeout normalization.
     let no_exclusions = BTreeSet::new();
     let mut field_best_raw = current_score.raw;
     let mut field_scores = BTreeMap::new();
@@ -2082,10 +2107,8 @@ fn modeled_official_score(
         0.0
     };
 
-    // The pessimistic twin, always computed and reported whenever it disagrees:
-    // what `current` would score if every SAT claim in the field were taken at
-    // face value. Withholding a disputed row must never be a quiet way to
-    // recover points, so the number it would have cost stays visible.
+    // Also report the score obtained by accepting every SAT claim, including
+    // NY's. This can increase the score when a NY witness lacks adjudication.
     let assumed_valid = adjudicate(
         benchmark,
         current,
@@ -2122,12 +2145,11 @@ pub(crate) struct ScoreOptions {
     /// Corpus years whose `instances.csv` budgets are enforced against the
     /// recorded runtimes. Empty leaves runtimes unchecked, and says so.
     pub(crate) budget_years: Vec<u32>,
-    /// How SAT rows are treated. Worth >100 points, so never implicit.
+    /// How SAT rows are treated.
     pub(crate) witnesses: Witnesses,
-    /// Published organiser adjudication (`SCORING/results.txt` in a released
-    /// results corpus, or the corpus root containing it). When `--official`
-    /// points at an unsanitized corpus this is found automatically; a sanitized
-    /// copy that dropped `SCORING/` needs it passed explicitly.
+    /// Historical 2025 truth summary: `SCORING/results.txt` or its corpus root.
+    /// Found automatically under `--official`; sanitized corpora need an
+    /// explicit path to the original summary.
     pub(crate) ground_truth: Option<PathBuf>,
     pub(crate) ny_ce_checks: Option<PathBuf>,
     pub(crate) ny_ce_source: Option<String>,
@@ -2242,6 +2264,33 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
         bail!("no result rows parsed from the supplied current/reference paths");
     }
 
+    let budgets = if opts.budget_years.is_empty() {
+        None
+    } else {
+        let mut years = opts.budget_years.clone();
+        years.sort_unstable();
+        years.dedup();
+        Some(load_budgets(&years)?)
+    };
+    let original_field_cohort = official.as_ref().map(|field| {
+        field
+            .values()
+            .flat_map(|rows| rows.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
+    let field_timeout_normalization =
+        if score_year == Some(ScoreYear::Y2026) && opts.budget_years.contains(&2026) {
+            match (&opts.official, &mut official, &budgets) {
+                (Some(root), Some(field), Some(table)) => {
+                    Some(field_timeouts::normalize(root, field, table)?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     let all_keys = current
         .keys()
         .chain(reference.keys())
@@ -2260,20 +2309,15 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
         );
     }
 
-    let budgets = if opts.budget_years.is_empty() {
-        None
-    } else {
-        let mut years = opts.budget_years.clone();
-        years.sort_unstable();
-        years.dedup();
-        Some(load_budgets(&years)?)
-    };
-
     let mut report = ProgressReport {
         modeled_score_caveat: official.as_ref().map(|_| match score_year {
+            Some(ScoreYear::Y2026) if field_timeout_normalization.is_some() => {
+                NORMALIZED_2026_SCORE_CAVEAT
+            }
             Some(ScoreYear::Y2026) => MODELED_2026_SCORE_CAVEAT,
             _ => MODELED_SCORE_CAVEAT,
         }),
+        field_timeout_normalization,
         score_year: official.as_ref().and(score_year),
         score_track: official.as_ref().map(|_| opts.track),
         unchecked_budget_caveat: budgets
@@ -2334,6 +2378,10 @@ pub(crate) fn run_score(opts: &ScoreOptions) -> Result<ProgressReport> {
                 &benchmark,
                 &current,
                 field,
+                report
+                    .field_timeout_normalization
+                    .as_ref()
+                    .and(original_field_cohort.as_ref()),
                 score_year.expect("official score year validated above"),
                 opts.track,
                 &over_budget_keys,
@@ -2571,6 +2619,20 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
             report.total_at_budget_solves
         ),
     }
+    if let Some(normalization) = &report.field_timeout_normalization {
+        println!(
+            "FIELD TIMEOUT NORMALIZATION: {} tool aggregate(s), {} late decision(s) changed to \
+             timeout, {} all-undecided tool categor{} removed; raw runtimes retained.",
+            normalization.tools.len(),
+            normalization.forced_timeouts,
+            normalization.removed_categories,
+            if normalization.removed_categories == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        );
+    }
 
     let show = |label: &str, pick: fn(&BenchProgress) -> &[String]| {
         let mut any = false;
@@ -2696,10 +2758,10 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
             .iter()
             .filter_map(|benchmark| {
                 let raw = benchmark.current_raw_score?;
-                let pessimistic = benchmark.current_raw_score_assumed_valid?;
-                (raw != pessimistic).then(|| {
+                let assumed_valid = benchmark.current_raw_score_assumed_valid?;
+                (raw != assumed_valid).then(|| {
                     format!(
-                        "{} {raw} (assumed-valid: {pessimistic})",
+                        "{} {raw} (assumed-valid: {assumed_valid})",
                         benchmark.benchmark
                     )
                 })
@@ -2707,8 +2769,8 @@ fn print_report(report: &ProgressReport, opts: &ScoreOptions) {
             .peekable();
         if moved.peek().is_some() {
             println!(
-                "  PESSIMISTIC TWIN — current raw under this model vs. under assumed-valid, \
-                 so withholding a disputed row can never quietly read as a gain: {}",
+                "  ASSUMED-VALID COMPARISON — current raw under this model vs. \
+                 accepting every SAT claim: {}",
                 moved.collect::<Vec<_>>().join("; ")
             );
         }
@@ -2880,6 +2942,7 @@ mod tests {
                 "acasxu_2023",
                 current,
                 &field,
+                None,
                 ScoreYear::Y2026,
                 ScoreTrack::Regular,
                 excluded,
@@ -3069,6 +3132,7 @@ mod tests {
             "acasxu_2023",
             &current,
             &field,
+            None,
             ScoreYear::Y2026,
             ScoreTrack::Regular,
             &BTreeSet::new(),
@@ -4271,7 +4335,7 @@ mod tests {
         assert_eq!(
             cgan.current_raw_score_assumed_valid,
             Some(3 * PENALTY_INCORRECT + POINTS_CORRECT),
-            "the pessimistic twin stays visible"
+            "the assumed-valid comparison stays visible"
         );
         assert!(
             cgan.disputed_rows
@@ -4447,9 +4511,8 @@ mod tests {
         assert_eq!(cgan.current_disputed, Some(0));
     }
 
-    /// The witness model is worth more than 100 normalized points, so both arms
-    /// are pinned. `unvalidated` is what the published 2025 board did, and it is
-    /// exactly what lets an unsound UNSAT keep its +10.
+    /// Assumed-valid witnesses penalize a contradicted UNSAT by -150;
+    /// the published 2025 board's unvalidated model retains its +10.
     #[test]
     fn the_witness_model_decides_whether_a_contradicted_unsat_is_punished() {
         let dir = TempDir::new().expect("tempdir");

@@ -131,6 +131,8 @@ pub(crate) mod input_rows;
 pub(crate) mod joint_grad;
 pub(crate) mod marginal;
 pub mod net;
+/// Qualified optional ordered arithmetic for compact root convolutions.
+pub mod packed_root_engine;
 /// #bi-patch: PER-COLUMN RECEPTIVE-FIELD (patch-mode) prefix passes for
 /// `#backward-interm` and `#joint-refresh` — each trunk-seeded column walks
 /// only its own receptive field, in virtual per-column frames, with the dense

@@ -4,60 +4,22 @@
 
 //! Host compute-backend detection (#backend-detect).
 //!
-//! ny runs on three kinds of host: CUDA machines (the competition regime),
-//! Apple-silicon laptops (Metal via wgpu), and CPU-only boxes. Which one a
-//! measurement ran on has repeatedly decided what the measurement MEANT —
-//! the cifar100/tinyimagenet timeout bank was frozen from a no-cuda regime
-//! the repo itself documented as "meaningless" (0/99 objectives GPU-off vs
-//! 98/99 in ~37s GPU-on, `CIFAR100_CUDA_BOOTSTRAP_BREAKTHROUGH_2026-07-15.md`),
-//! and nothing in the rows records the difference. This module makes the
-//! regime explicit: probe once per process, log one line that survives
-//! `RUST_LOG=error` (the scored paths set it), and hand sweeps a string to
-//! seal into their manifest.
+//! Cache host capability evidence once per process, log it even under
+//! `RUST_LOG=error`, and supply it to sweep manifests. Detection is separate
+//! from proof-backend qualification.
 //!
-//! Detection is deliberately cheap. The CUDA half checks library presence and
-//! asks the driver for its context-free visible-device count. On non-CUDA
-//! hosts the wgpu half is an adapter query with no device or shader
-//! compilation. CUDA hosts skip that redundant query: Vulkan
-//! `request_adapter` may allocate an NVIDIA graphics context even without a
-//! wgpu device, which adds process-start churn and can fail under driver-memory
-//! pressure. Engine registration stays with `main.rs` and its lazy factories.
-//! Enabled CUDA detection pays `cuInit`/`cuDeviceGetCount`, but attack-only
-//! instances still never create a CUDA context or initialize the GEMM engine.
+//! CUDA detection checks library presence and the visible-device count.
+//! WGPU independently queries an adapter without creating a device or compiling
+//! shaders, including on healthy CUDA hosts: the two backends supply different
+//! capabilities. An indeterminate CUDA device query suppresses the WGPU probe
+//! to avoid re-entering unhealthy NVIDIA userspace. Engine registration and
+//! lazy construction remain in `main.rs`.
 //!
-//! The verdict-soundness story per backend (see `sound_gpu_gate.rs`):
-//! - **cuda**: sound f64 GEMM seams (cuBLAS Dgemm, certified rounding bound);
-//!   resident CUDA CROWN behind its qualification gates.
-//! - **metal / other wgpu**: the public CLI route constructs a typed proof
-//!   device and retains it only when every live qualification rung passes.
-//!   WGSL has no f64 — but that
-//!   is not the reason, and the older "the shaders carry no certified error
-//!   term" claim here was simply wrong about the SOUND lane. The sound-resident
-//!   shaders have carried a certified error term in pure f32 for a long time
-//!   (Higham `γ_k·S`, host-side outward-rounded uniforms; ny-gpu
-//!   `wgpu_device/sound_consts.rs:13` states the design as "no f64 ever enters a
-//!   WGSL body"), and the EFT/double-single channel supplies an f64-grade
-//!   compensated residual WITHOUT f64. Both EFT primitives measured bit-exact on
-//!   an Apple M5 Max / Metal adapter on 2026-08-04 (fma TwoProduct 509/509
-//!   lanes, fma-barrier TwoSum 307/307, 0 ULP).
-//!
-//!   Bit-exact primitives are not the whole precondition (`#u2b`, 2026-08-06):
-//!   the compensated channel's residual identity also requires GRADUAL
-//!   UNDERFLOW, and this adapter is measured to flush subnormals (DAZ + FTZ,
-//!   7/15 probe lanes, and an EFT residual is among the silently-zeroed lanes).
-//!   `verify_eft_primitives()` now ENTAILS `verify_gradual_underflow()`, so it
-//!   reports `false` on this adapter and the compensated channel refuses itself
-//!   here. The raw probes still pass — that is a measurement, not an
-//!   authorization.
-//!
-//!   U1/U3/U4/U5/U6 and B0 are now discharged, and the raw `WgpuDevice` CROWN
-//!   source gate and public integration are open. Authority still requires an
-//!   explicit typed request and every live adapter probe; this Metal adapter
-//!   fails the composed gradual-underflow gate and therefore emits a recorded
-//!   CPU fallback. A conforming adapter retains the exact qualified context.
-//!   Measured raw primitives alone are NOT verdict authority. See
-//!   `docs/CURRENT_STATE_2026-08-10.md#wgpu-verdict-authority`.
-//! - **cpu-only**: the proven-sound f64 CROWN path, at CPU speed.
+//! CUDA supplies certified f64 GEMM seams and separately gated resident CROWN.
+//! For WGPU proof work, `commands/backend.rs` tries the typed uncharged
+//! constructor, then the flush-charged constructor, retaining the exact device
+//! and its qualification receipt on success. If both refuse, it records the
+//! refusal and uses CPU f64. Adapter discovery alone grants no verdict authority.
 
 use std::sync::OnceLock;
 
@@ -72,13 +34,11 @@ pub(crate) struct BackendReport {
     /// The one cached WGPU adapter observation, if probing was safe and found
     /// hardware. Never re-query Vulkan merely to render provenance.
     pub(crate) wgpu_adapter: Option<ny_gpu::AdapterProbe>,
-    /// NVIDIA driver/device evidence made a Vulkan adapter query unsafe or
-    /// redundant for this process.
+    /// An indeterminate CUDA query suppressed WGPU adapter probing.
     pub(crate) wgpu_probe_skipped: bool,
     /// A visible CUDA device plus the required driver/engine libraries makes
     /// the process-global CUDA GEMM factory a usable accelerator candidate.
-    /// This is separate from WGPU adapter presence: NVIDIA hosts deliberately
-    /// skip that redundant graphics-API probe.
+    /// WGPU adapter availability is independent of this candidate.
     pub(crate) cuda_engine_candidate: bool,
 }
 
@@ -90,7 +50,7 @@ pub(crate) fn detect() -> &'static BackendReport {
         let adapter = maybe_probe_wgpu(cuda.avoid_wgpu_probe, ny_gpu::WgpuDevice::probe_adapter);
 
         let adapter_desc = if cuda.avoid_wgpu_probe {
-            "skipped (NVIDIA driver/device evidence; avoid redundant graphics context)".to_string()
+            "skipped (indeterminate CUDA query; avoid unhealthy NVIDIA userspace)".to_string()
         } else {
             adapter.as_ref().map_or_else(
                 || "none".to_string(),
@@ -107,12 +67,8 @@ pub(crate) fn detect() -> &'static BackendReport {
                 "CUDA f64 GEMM seams + CPU f64 CROWN (resident CUDA CROWN behind its gates)",
             )
         } else if metal {
-            // #flush-charge: the charged-Metal narration is gated on the
-            // build's charged source gate so the CLOSED state stays
-            // byte-identical to the pre-chain summary. The gate state is a
-            // compile-time fact (`ny_gpu::wgpu_charged_proof_authority`);
-            // the per-run qualified/refused outcome is carried by the
-            // ProofBackendReceipt and the NY-HARNESS override marker.
+            // Narrate the source gate here; ProofBackendReceipt and the
+            // NY-HARNESS marker carry the run's actual qualification outcome.
             let metal_sound_path = if ny_gpu::wgpu_charged_proof_authority() {
                 "Metal CROWN qualified WITH FLUSH CHARGES when the typed charged \
                  constructor's live pure-flush ladder passes (charged source gate OPEN; \
@@ -152,9 +108,8 @@ pub(crate) fn detect() -> &'static BackendReport {
     })
 }
 
-/// A process with NVIDIA driver/device evidence does not need a second graphics
-/// API merely to describe its compute regime. Keep the decision injectable so
-/// tests prove that branch cannot execute the driver-facing probe.
+/// Apply the CUDA safety skip before calling the adapter probe. The injectable
+/// probe lets tests verify that a skipped query cannot enter the graphics API.
 fn maybe_probe_wgpu(
     skip_probe: bool,
     probe: impl FnOnce() -> Option<ny_gpu::AdapterProbe>,
@@ -171,7 +126,7 @@ fn render_wgpu_adapter_provenance(
         return ny_gpu::WgpuAdapterProvenance {
             hardware_available: false,
             description:
-                "probe skipped: NVIDIA driver/device evidence; redundant graphics context avoided"
+                "probe skipped: indeterminate CUDA query; unhealthy NVIDIA userspace avoided"
                     .to_string(),
         };
     }
@@ -190,13 +145,7 @@ fn render_wgpu_adapter_provenance(
     )
 }
 
-/// Log the detected backend on the scored path.
-///
-/// `eprintln!`, not `tracing`: every scored entry point runs under
-/// `RUST_LOG=error` (`run_instance.sh`, `measure_ny_scorecard.sh:667`,
-/// `vnncomp_sweep.rs`), so an info/warn line is invisible exactly where the
-/// regime matters. Stderr lands in the per-instance logs those harnesses
-/// already capture.
+/// Log once to stderr so harnesses using `RUST_LOG=error` retain the evidence.
 pub(crate) fn log_once() {
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
@@ -204,14 +153,8 @@ pub(crate) fn log_once() {
     });
 }
 
-/// Static host identity, probed once per process (#host-provenance).
-///
-/// Two timings are only comparable when they came from the same machine
-/// class AND a known load regime — the 2026-07-29 audit called 900s timings
-/// under load 63.7 "meaningless", and the cgan parity sweep proved the
-/// sealed row-7 UNSAT was a different-host result. Identity is static and
-/// cached; load is per-moment and deliberately NOT cached — see
-/// [`load_average`].
+/// Cached host identity for measurement provenance. Sample changing load
+/// separately with [`load_average`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct HostProbe {
     pub(crate) hostname: String,
@@ -221,8 +164,7 @@ pub(crate) struct HostProbe {
 }
 
 impl HostProbe {
-    /// One line for manifests: everything a reader needs to decide whether
-    /// two timing measurements are even comparable.
+    /// Host hardware summary; record resource limits, load and build identity separately.
     pub(crate) fn summary(&self) -> String {
         format!(
             "{} | {} | {} cores | {} GiB",
@@ -244,11 +186,8 @@ pub(crate) fn host() -> &'static HostProbe {
     })
 }
 
-/// The 1/5/15-minute load averages RIGHT NOW — never cached, because load is
-/// the per-moment fact that decides whether a wall-clock timing means
-/// anything. Callers sample it at run start and again at artifact write, so
-/// a row that ran on a busy box carries the evidence. Best-effort: `None` on
-/// platforms without a probe, never an error.
+/// Current 1/5/15-minute load averages, sampled at run start and artifact write.
+/// Returns `None` on platforms without a probe; never cached.
 pub(crate) fn load_average() -> Option<[f64; 3]> {
     #[cfg(target_os = "macos")]
     {
@@ -268,13 +207,7 @@ pub(crate) fn load_average() -> Option<[f64; 3]> {
     }
 }
 
-/// Pure split-and-parse helper behind [`load_average`].
-///
-/// Production callers exist only in the macOS and Linux arms above — no other
-/// platform has a load-average source — so a Windows BIN build reaches none of
-/// them and the function is dead there. It is deliberately NOT `#[cfg]`-gated:
-/// the unit tests below exercise it on every platform, and keeping it compiled
-/// everywhere means it cannot rot behind a gate that hides it from the build.
+/// Parse load averages; kept available to tests on every platform.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     allow(dead_code, reason = "no load-average source on this platform")
@@ -347,9 +280,8 @@ struct CudaState {
     /// A visible device and both libraries make lazy engine construction worth
     /// attempting. Context/cuBLAS allocation and self-check remain unconfirmed.
     engine_candidate: bool,
-    /// Strong enough NVIDIA evidence to avoid asking Vulkan for a second
-    /// graphics context. This is intentionally independent of NY_NO_CUDA and
-    /// libcublas availability.
+    /// An indeterminate device query suppresses re-entry into NVIDIA userspace,
+    /// independently of NY_NO_CUDA and libcublas availability.
     avoid_wgpu_probe: bool,
     describe: String,
 }
@@ -378,42 +310,10 @@ fn decide_cuda(
 ) -> CudaDecision {
     let visible_device = matches!(device_probe, CudaDeviceProbe::Count(count) if count > 0);
     let engine_candidate = !disabled && visible_device && engine_libraries_present;
-    // THE ONLY REASON TO SKIP THE PROBE IS SAFETY. A driver-init/symbol error
-    // means the NVIDIA userspace stack is unhealthy and Vulkan would provoke the
-    // same stack, so fail safe. That is `Indeterminate` specifically.
-    // `DriverAbsent` and a valid `Count(0)` are NOT errors — they say no NVIDIA
-    // device is available to this process, so an AMD/Intel/Metal adapter may
-    // legitimately be found. The original comment said exactly this and the
-    // predicate then ignored it.
-    //
-    // WHY REDUNDANCY IS NOT A REASON, which is the substantive change here.
-    // CUDA and wgpu are not two implementations of one capability; they populate
-    // DIFFERENT capability slots, and ny already registers them separately
-    // (`sound_f64_gemm`, `fast_f32_gemm`, `sound_gpu_gate` in ny-cli/src/main.rs).
-    // CUDA owns the f64 GEMM seams and the fast f32 GEMM (cuBLAS Sgemm is
-    // measured 2-3.4x faster than the WGSL shader). But
-    // `provides_sound_intermediate_sweep` has exactly ONE implementation in the
-    // tree — `ny-gpu/src/wgpu_device/ops/crown_backward.rs` — and
-    // `CudaGemmEngine`'s `GpuCrownBackward` impl does not override the `false`
-    // default in `ny-core/src/gemm.rs`. So the comprehensive row-chunked root
-    // sweep, which `configs/vnncomp25/cifar100_2024.yaml` ARMS by default and
-    // which is the mechanism behind the 0/99 -> 95/99 root census, gates on a
-    // capability only wgpu provides:
-    //
-    //     if !gpu.provides_sound_gpu_crown() || !gpu.provides_sound_intermediate_sweep()
-    //         { return RootIntermediateSweepAttempt::CleanDecline; }
-    //
-    // Skipping the probe because a CUDA engine exists therefore did not avoid a
-    // redundant context — it silently deleted the sweep from every NVIDIA host,
-    // while the preset went on claiming it was armed. One extra graphics context
-    // is a cheap price for the repository's single largest root-bound result.
-    //
-    // The former predicate also read `nvidia_kernel_driver_present || ...`, so
-    // mere driver PRESENCE skipped the probe even with CUDA disabled by
-    // NY_NO_CUDA or absent from the build. That is why
-    // docs/VNNCOMP_CRITICAL_PATH_2026-08-12.md's `NY_NO_CUDA=1 NY_WGPU_CROWN=1`
-    // experiment landed on CPU f64 and concluded "there is no GPU f32 CROWN lane
-    // for the bound path at all". The lane existed; the adapter was never probed.
+    // Only an indeterminate CUDA query suppresses WGPU probing, to avoid
+    // re-entering unhealthy NVIDIA userspace. Healthy CUDA and WGPU supply
+    // different capabilities, including WGPU's intermediate sweep. Engine
+    // availability, disablement and kernel-driver presence do not govern this skip.
     let unhealthy_nvidia_userspace = matches!(device_probe, CudaDeviceProbe::Indeterminate);
     let _ = nvidia_kernel_driver_present;
     CudaDecision {
@@ -503,8 +403,7 @@ fn cuda_state() -> CudaState {
     let kernel_driver_present = nvidia_kernel_driver_present();
     CudaState {
         engine_candidate: false,
-        // No CUDA engine in this build, so a "redundant" graphics context cannot
-        // be redundant with anything. Probe the adapter we can actually use.
+        // No CUDA userspace query ran, so no indeterminate result requires a skip.
         avoid_wgpu_probe: false,
         describe: format!(
             "not compiled (build with --features cuda), NVIDIA kernel driver={}",
@@ -614,17 +513,8 @@ mod tests {
 
     #[test]
     fn the_wgpu_probe_skip_needs_a_reason_not_merely_a_driver() {
-        // Was `loaded_nvidia_kernel_driver_forces_process_wide_wgpu_skip`, which
-        // pinned the policy rather than an invariant: any loaded NVIDIA kernel
-        // driver skipped the probe process-wide. That is why a build without
-        // --features cuda, on a healthy NVIDIA host, reported `cpu-only` while a
-        // usable GPU sat idle, and why `NY_NO_CUDA=1 NY_WGPU_CROWN=1` could not
-        // reach the WGPU proof route.
-        //
-        // The invariant that actually matters: a skip must be justified by
-        // REDUNDANCY (a CUDA engine we will really use) or by SAFETY (an
-        // unhealthy NVIDIA userspace stack Vulkan would provoke). Driver
-        // presence alone is neither.
+        // Only an indeterminate CUDA query justifies the safety skip; driver
+        // presence or a usable CUDA engine alone does not.
         let report = detect();
         if report.wgpu_probe_skipped {
             assert!(
@@ -660,11 +550,7 @@ mod tests {
                     avoid_wgpu_probe: false,
                 },
             ),
-            // CUDA is a real candidate here — and wgpu is STILL probed. They
-            // populate different capability slots; only wgpu implements
-            // `provides_sound_intermediate_sweep`, which the shipped cifar100
-            // preset arms. Skipping the probe here deleted that sweep from every
-            // NVIDIA host.
+            // A healthy CUDA engine leaves WGPU's independent capabilities discoverable.
             (
                 false,
                 CudaDeviceProbe::Count(1),
@@ -675,8 +561,7 @@ mod tests {
                     avoid_wgpu_probe: false,
                 },
             ),
-            // Device visible but CUDA libraries incomplete: the engine cannot
-            // run, so there is nothing for a wgpu context to be redundant with.
+            // Incomplete CUDA engine libraries do not suppress WGPU discovery.
             (
                 false,
                 CudaDeviceProbe::Count(1),
@@ -687,9 +572,7 @@ mod tests {
                     avoid_wgpu_probe: false,
                 },
             ),
-            // NY_NO_CUDA: the operator disabled CUDA to use something else.
-            // Skipping the probe here is how `NY_NO_CUDA=1 NY_WGPU_CROWN=1`
-            // used to land on CPU f64.
+            // Explicitly disabling CUDA still permits WGPU discovery.
             (
                 true,
                 CudaDeviceProbe::Count(1),
@@ -710,10 +593,8 @@ mod tests {
                     avoid_wgpu_probe: true,
                 },
             ),
-            // Kernel driver present but libcuda absent. Driver PRESENCE alone
-            // must not skip the probe: the kernel driver is healthy, Vulkan
-            // reaches it through a different userspace library, and CUDA is
-            // unusable. This is the case that left an RTX 5080 on cpu-only.
+            // Kernel-driver presence without libcuda does not establish an
+            // indeterminate query; keep WGPU discovery available.
             (
                 false,
                 CudaDeviceProbe::DriverAbsent,
@@ -724,10 +605,7 @@ mod tests {
                     avoid_wgpu_probe: false,
                 },
             ),
-            // The SAFETY case survives unchanged: a driver-init/symbol error
-            // means the NVIDIA userspace stack is unhealthy and Vulkan would
-            // provoke the same stack, so refuse the probe even though the CUDA
-            // engine is not a candidate either.
+            // An indeterminate query suppresses WGPU even without usable CUDA libraries.
             (
                 false,
                 CudaDeviceProbe::Indeterminate,

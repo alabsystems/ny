@@ -16,11 +16,9 @@
 mod axis;
 mod bound;
 mod bound_tightener;
-/// #cost-observer: invariant I1's missing PRODUCER. `#phase-window` requires a
-/// cost "predicted on this host, from a measured rate, not a constant", but the
-/// only two producers in the tree need an analytic MAC model. This measures a
-/// repeated seam's OWN per-call cost as the run proceeds and derives the
-/// allowance from that measurement plus the live remaining wall.
+/// #cost-observer: measured per-call cost estimates for invariant I1.
+/// For repeated seams without an analytic MAC model, derive an allowance
+/// from observed call costs and the live remaining wall.
 pub mod cost_observer;
 mod counterexample;
 mod custom_op;
@@ -75,6 +73,8 @@ pub mod margin_row_lane_gpu;
 pub mod memory_lease;
 mod nan_math;
 mod output_constraint;
+/// Exact ordered paired-f32 contraction for admitted compact root plans.
+pub mod packed_root_conv;
 /// #phase-scheduler: the marginal-value loop that composes I1/I2/I3 — spend the
 /// next block wherever `Δ(min_r slack_r)/second` is highest.
 pub mod phase_scheduler;

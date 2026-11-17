@@ -129,7 +129,7 @@ ny-mip = { path = "../ny-mip", optional = true }
 # `ResolutionDag::validate` — the in-memory refutation certificate and its
 # independent RUP replay that the UNSAT direction is required to pass before
 # any `Verified` verdict is emitted.
-ay-sat = { version = "0.28.2", git = "https://github.com/alabsystems/ay.git", rev = "8bbc43108643d475a81a89b2b4f262e817ee1724", default-features = false, features = ["unsat-cert"] }
+ay-sat = { version = "0.28.4", git = "https://github.com/alabsystems/ay.git", rev = "12d411d420e27eea05099f8cd277eb288e8622c9", default-features = false, features = ["unsat-cert"] }
 # Exact rational arithmetic for the graph-MIP pinned-column fold (inc5c) —
 # the same exact seam ny-mip already uses (`num_rational::BigRational`).
 num-rational = { workspace = true, optional = true }
@@ -177,10 +177,9 @@ sha2.workspace = true
 
 [dev-dependencies]
 ny-test-utils = { path = "../ny-test-utils" }
-# #flush-charge Lane B: the metaroom charged wall-clock acceptance test needs
-# the TEST-SCOPED charged constructor, which ny-gpu compiles only under its
-# `gpu-tests` feature (never enabled by any production dependency edge; this
-# dev-only edge affects `cargo test -p ny-cli` builds exclusively).
+# The metaroom charged wall-clock test needs ny-gpu's test-scoped constructor.
+# This dev dependency enables `gpu-tests` in CLI tests and unifies the feature
+# into workspace tests, which therefore include real-adapter tests.
 ny-gpu = { path = "../ny-gpu", features = ["gpu-tests"] }
 rand.workspace = true
 prost.workspace = true

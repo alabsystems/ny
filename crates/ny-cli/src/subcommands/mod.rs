@@ -4,9 +4,7 @@
 
 //! Command-line subcommand definitions.
 //!
-//! The `Commands` enum (clap `#[derive(Subcommand)]`) must remain in one file
-//! because clap requires the full enum for derive. Shared CLI types are
-//! extracted to `cli_types` to reduce coupling.
+//! Shared argument types live in `cli_types` and `whisper_args`.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -19,7 +17,6 @@ pub(crate) mod whisper_args;
 #[cfg(test)]
 mod tests;
 
-// Re-export shared CLI types at this module level for backwards compatibility
 pub(crate) use cli_types::{
     AlphaGradientMethodArg, AlphaOptimizerArg, BackendArg, CompleteVerifierArg, LayerNormModeArg,
     LayerNormNormModeArg, LogFormat, MipSolverArg, MulBinaryRelaxationArg,
@@ -82,12 +79,12 @@ pub(crate) struct VerifyArgs {
     pub(crate) property: Option<PathBuf>,
 
     /// Peel off terminal Softmax/LogSoftmax/Sigmoid when constraints are logit comparisons (true/false).
-    /// Requires --property (VNN-LIB).
+    /// Ignored without --property (VNN-LIB).
     #[arg(long, value_parser = clap::value_parser!(bool))]
     pub(crate) peel_off_last_softmax_layer: Option<bool>,
 
     /// Verification method (ibp, crown, alpha, or beta; default: alpha).
-    /// Beta is sequential-only; use `beta-crown` for ONNX graph branch-and-bound.
+    /// Beta requires an NNet (.nnet) model; use `beta-crown` for ONNX graphs.
     #[arg(long)]
     pub(crate) method: Option<String>,
 
@@ -234,7 +231,7 @@ pub(crate) struct BenchArgs {
     /// Branching heuristic for the acasxu benchmark (default: input)
     ///
     /// Values: width, impact, babsr, fsb, kfsb, kfsb-intercept-only, sequential,
-    /// input. With --gpu-bab, only impact and babsr are supported.
+    /// input. With --gpu-bab, use impact, babsr, or input.
     #[arg(long, default_value = "input")]
     pub(crate) branching: String,
 
@@ -267,9 +264,8 @@ pub(crate) struct BenchArgs {
     pub(crate) pgd_restarts: Option<usize>,
 
     /// Use GPU-accelerated BaB with DomainList storage (for acasxu benchmark).
-    /// Routes verification through verify_graph_gpu_domain_list instead of
-    /// sequential verify(). Currently supports only:
-    /// `--branching=impact` (alias: `--branching=babsr`).
+    /// Routes verification through verify_graph_gpu_domain_list.
+    /// Supports `--branching=impact` (alias: `babsr`) and `--branching=input`.
     #[arg(long, default_value_t = false)]
     pub(crate) gpu_bab: bool,
 
@@ -314,7 +310,7 @@ pub(crate) struct BetaCrownArgs {
     pub(crate) threshold: f32,
 
     /// Peel off terminal Softmax/LogSoftmax/Sigmoid when constraints are logit comparisons.
-    /// Requires --property (VNN-LIB).
+    /// Ignored without --property (VNN-LIB).
     #[arg(long, default_value_t = false)]
     pub(crate) peel_off_last_softmax_layer: bool,
 
@@ -353,9 +349,10 @@ pub(crate) struct BetaCrownArgs {
     /// Branching heuristic (default: auto)
     ///
     /// Values: auto, width, impact (or babsr), fsb, kfsb, kfsb-intercept-only,
-    /// sequential, input, relu. `auto` picks input splitting for
-    /// low-dimensional inputs and ReLU splitting with kFSB otherwise. An
-    /// explicit value, or a preset's `bab.branching.method`, overrides it.
+    /// sequential, input, relu. `auto` selects kFSB in MIP-complete mode;
+    /// otherwise input splitting for low-dimensional inputs or small, shallow
+    /// models with moderate inputs, and kFSB for remaining models. Explicit
+    /// values and a preset's `bab.branching.method` override `auto`.
     #[arg(long, default_value = "auto")]
     pub(crate) branching: Option<String>,
 
@@ -402,9 +399,8 @@ pub(crate) struct BetaCrownArgs {
 
     /// Use CROWN-IBP instead of IBP for intermediate bounds
     ///
-    /// Tighter, but time and memory can be extreme on large graphs (one case
-    /// exceeded 100 GiB). Use it only on small graphs, under an external
-    /// memory limit.
+    /// Can require substantial time and memory on large graphs. Run under an
+    /// external memory limit; --max-queue-bytes does not cap this work.
     #[arg(long, default_value_t = false)]
     pub(crate) crown_ibp_intermediates: bool,
 
@@ -657,10 +653,10 @@ pub(crate) struct BetaCrownArgs {
 
     /// Proof profile: `proof` (this subcommand's default) or `competition`
     ///
-    /// `proof` writes proof artifacts and runs the downgrade-only audits at
-    /// full rates; `competition` wires a null artifact sink and samples the
-    /// audits. Neither changes certification: every certificate, the cover
-    /// gate and the guards run identically in both. Printed as
+    /// `proof` enables optional artifacts and runs downgrade-only audits at
+    /// full rates; `competition` skips optional artifacts by default and samples
+    /// the audits. Verdict certifiers, the cover gate and guards run identically
+    /// in both profiles. Printed as
     /// `[proof-profile] mode=<m> source=<entry|cli>`.
     #[arg(long, value_parser = parse_proof_profile)]
     pub(crate) proof_profile: Option<ny_core::proof_profile::ProofProfile>,
@@ -731,7 +727,7 @@ pub(crate) struct ProofCheckArgs {
     #[arg(long)]
     pub(crate) report: Option<PathBuf>,
 
-    /// Worker threads (default: all cores)
+    /// Worker threads (default: Rayon configuration)
     #[arg(long)]
     pub(crate) threads: Option<usize>,
 
@@ -1323,18 +1319,14 @@ pub(crate) enum Commands {
     /// the standalone `ny-claims` binary, which builds much faster.
     Claims(ny_claims::cli::ClaimsArgs),
 
-    /// Learn to verify neural networks, interactively (start with no argument)
+    /// Short verification lessons and a runnable demo (start with no argument)
     Tutorial {
         #[command(subcommand)]
         topic: Option<commands::tutorial::TutorialTopic>,
     },
 }
 
-/// VNN-COMP subcommands. `v1` is the scored protocol; `plan` is the I2
-/// explicit-plan printer over the same inputs. Both spell their argv exactly
-/// as the competition harness does, so `ny vnncomp v1 CATEGORY ONNX VNNLIB
-/// RESULTS_FILE TIMEOUT [--configs-dir DIR]` is byte-identical to the
-/// pre-subcommand CLI (the wrapper and sweep invocations never change).
+/// Run the VNN-COMP protocol or inspect its resolved plan.
 #[derive(Subcommand)]
 pub(crate) enum VnncompAction {
     /// Run one VNN-COMP instance exactly as the competition harness does

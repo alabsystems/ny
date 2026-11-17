@@ -4,14 +4,9 @@
 
 //! Proof-carrying certificate adapter.
 //!
-//! After β-CROWN returns a `Verified` verdict, this re-derives an
-//! **exact-rational** CROWN certificate from the verified network and the
-//! property's input box using the `ny-cert` crate, runs the in-tree self-check
-//! (entailment + Farkas replay), and writes a `.cert.json` sidecar that Clean's
-//! trusted, kernel-backed external-certificate verifier can check. This turns a
-//! `Verified` verdict into a machine-checkable proof rather than a
-//! floating-point claim — the headline of NY's *Proof-Carrying Verification*
-//! program (see `crates/ny-cert/src/lib.rs`).
+//! For eligible `Verified` results, derive an exact-rational CROWN certificate
+//! from the network and property using `ny-cert`. Self-check entailment and
+//! Farkas replay before writing a `.cert.json` sidecar for Clean to check.
 //!
 //! ## Soundness / scope invariants
 //!
@@ -30,9 +25,9 @@
 //! * **Weights are converted to rationals EXACTLY** via their dyadic IEEE-754
 //!   value (no rounding), so the certificate attests the f32-realised network
 //!   the verifier actually ran on — it is faithful to the verified object.
-//! * **Emission is gated by `ProofOpts`:** ON by default, OFF in competition
-//!   mode (the VNN-COMP scored entry point), where the exact-arithmetic pass is
-//!   pure overhead.
+//! * **`ProofOpts` resolves emission:** enabled by default in proof mode and
+//!   disabled by default in competition mode. An explicit request overrides the
+//!   profile; `require_certificate` also overrides suppression.
 
 use std::path::PathBuf;
 
@@ -45,11 +40,8 @@ use tracing::{info, warn};
 use super::dispatch::DispatchContext;
 use super::BetaCrownModel;
 
-/// Upper bound on the total neuron count we attempt to certify. Exact rational
-/// CROWN over a large net can create very large intermediate values and consume
-/// excessive time/memory; above this we skip (non-fatal). Pure-FC eligible
-/// categories (sat_relu, soundnessbench, small ACAS-style nets) sit well under
-/// this.
+/// Maximum hidden-neuron count for optional exact-rational CROWN certification.
+/// Larger networks skip emission to limit intermediate arithmetic and memory.
 const MAX_CERT_NEURONS: usize = 8192;
 
 /// Convert an `f32` to its EXACT dyadic rational value (no rounding).
@@ -328,8 +320,7 @@ pub(super) fn maybe_emit_certificate(
     if !matches!(result.result, BabVerificationStatus::Verified) {
         return;
     }
-    // Gate 2: proof/cert features must be enabled (the Proof profile's sink;
-    // the Competition profile wires a null sink).
+    // Gate 2: honor the resolved profile, emission override and certificate requirement.
     if !ctx.proof_opts.should_emit_certificate() {
         return;
     }
@@ -337,13 +328,8 @@ pub(super) fn maybe_emit_certificate(
     // RECORDED (`artifact=none`), never a refusal of the verdict — the `cert:`
     // log line of whichever exit declined carries the detail.
     let mut artifact = ArtifactRecord::default();
-    // Gate 2b: the certificate is an OPTIONAL post-verdict sidecar, but
-    // exact-rational deep-CROWN can run for tens of seconds on adversarial nets
-    // (e.g. acasxu's 6-layer unstable-ReLU stack, whose interned rationals grow
-    // to thousands of bits). It must NEVER push the CLI past the caller's overall
-    // `--timeout`. If too little of that budget remains to finish, skip emission
-    // outright — the verdict is already decided and unaffected. When some budget
-    // does remain, the emission deadline below is additionally clamped to it.
+    // Gate 2b: skip optional derivation when less than the minimum budget remains.
+    // Clamp its later cooperative deadline to the overall timeout.
     const CERT_MIN_REMAINING: std::time::Duration = std::time::Duration::from_secs(2);
     if let Some(dl) = overall_deadline {
         let remaining = dl.checked_duration_since(std::time::Instant::now());
@@ -386,18 +372,9 @@ pub(super) fn maybe_emit_certificate(
         return;
     };
 
-    // Wall-clock budget for the WHOLE emission pass (all margins). The verdict
-    // is already decided and a certificate is an optional sidecar, but exact
-    // rational deep-CROWN can blow up on adversarial magnitudes (observed:
-    // acasxu max-diff margins accumulating million-bit rationals stalled the
-    // CLI indefinitely AFTER verification finished — the verdict never
-    // printed). Bound the post-verdict work and fail open to "no certificate".
-    // NY_CERT_BUDGET_SECS overrides the default 60s; 0 disables the cap.
-    // An unparseable value falls back to the default WITH a warning (silent
-    // fallback would mask an operator typo); a huge value that would overflow
-    // `Instant + Duration` degrades to uncapped via `checked_add` — never a
-    // panic, which (pre-verdict-print ordering aside) must not exist on an
-    // infallible-by-contract path.
+    // One cooperative budget covers all margins; exhaustion omits the sidecar.
+    // NY_CERT_BUDGET_SECS defaults to 60s, with a warning on invalid input.
+    // Zero or Instant overflow removes this cap; the overall deadline still applies.
     let budget_env = std::env::var("NY_CERT_BUDGET_SECS").ok();
     let budget_secs = match budget_env.as_deref() {
         None => 60,
@@ -412,11 +389,8 @@ pub(super) fn maybe_emit_certificate(
             }
         },
     };
-    // The emission deadline is the SOONER of the cert-specific budget
-    // (NY_CERT_BUDGET_SECS, default 60s; 0 = uncapped) and the caller's overall
-    // --timeout deadline (Gate 2b already skipped when < CERT_MIN_REMAINING
-    // remained). The sidecar must never overrun the competition budget, so the
-    // overall deadline binds even when the cert budget is uncapped.
+    // Use the earlier of the certificate budget and the overall deadline,
+    // including when the certificate budget is uncapped.
     let cert_budget_deadline = if budget_secs > 0 {
         match std::time::Instant::now().checked_add(std::time::Duration::from_secs(budget_secs)) {
             Some(d) => Some(d),

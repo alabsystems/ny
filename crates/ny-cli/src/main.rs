@@ -238,6 +238,11 @@ fn emit_cuda_deadline_f64_post_command_telemetry() {
                 ny_propagate::sound_f64_gemm::deadline_admission_stats(),
             )
         );
+        let packed = ny_cuda::packed_root::stats();
+        eprintln!(
+            "NY_PACKED_ROOT_CUDA_V1 completed={} dispatches={} wall_us={}",
+            packed.completed, packed.dispatches, packed.wall_us
+        );
     }
 }
 
@@ -541,12 +546,9 @@ fn run() -> Result<()> {
     if matches!(&command, Commands::InternalHeadPhaseCoverAyAdvice) {
         return head_phase_advice::run_phase_cover_helper();
     }
-    // Proof-capable commands decide WGPU ownership only after resolving their
-    // CLI/config/preset request and running live qualification. Do not install
-    // the independent lazy FL-value context before that decision: a plan-rate
-    // probe could materialize it and then leave two WGPU contexts alive when
-    // the qualified proof device is retained. CPU/fallback routes install the
-    // auxiliary factory later inside their command handler.
+    // Proof commands resolve and qualify their WGPU device in the handler.
+    // Defer the auxiliary FL-value factory to avoid a rate probe creating a
+    // second context before that decision; CPU/fallback handlers install it.
     let command_resolves_proof_backend = matches!(
         &command,
         Commands::Verify(_) | Commands::BetaCrown(_) | Commands::Vnncomp { .. }
@@ -586,16 +588,9 @@ fn run() -> Result<()> {
         }
     }
 
-    // Install the native CUDA / cuBLAS sound f64 GEMM accelerator if built with
-    // `--features cuda`, a process-visible CUDA device exists, and candidate
-    // libcuda/libcublas names are transiently dlopen-able. The engine
-    // constructor remains authoritative: it selects and retains its actual
-    // objects, validates their mapped providers on Linux, and runs its device
-    // self-checks. This factory routes the sound CPU
-    // CROWN backward's f64 `A·W` / `|A|·|W|` products to cuBLAS Dgemm with a
-    // sound order-independent γ_n·S bound. Actual speed depends strongly on
-    // topology and precision (especially consumer-GPU FP64). No-op when startup
-    // admission fails.
+    // CUDA admission checks the feature, visible device, and loadable
+    // driver/cuBLAS candidates. The engine later validates its retained
+    // providers and device arithmetic; CROWN callers charge γ_n·S for Dgemm.
     let cuda_crown_requested = exact_boolean_env("NY_CUDA_CROWN")?;
     // These overrides are startup-admission hints. `ny-cuda` remains
     // authoritative over exact parsing, compatibility with the detected
@@ -624,29 +619,16 @@ fn run() -> Result<()> {
         resolve_cuda_startup_action(false, false, false, cuda_acceleration_requested);
     #[cfg(feature = "cuda")]
     if matches!(cuda_startup_action, CudaStartupAction::RegisterFactories) {
-        // Install LAZY factories: one shared CUDA engine (one GPU context + cuBLAS
-        // handle), built on first use, drives BOTH the sound f64 `A·W` GEMM seam
-        // AND the sound f64-exact GPU-resident CROWN backward. Lazy ⇒
-        // CPU-trivial/small-input instances never pay the ~0.4s GPU init;
-        // large-image attack steering materializes this same shared engine.
-        // `vnncomp` explicitly prewarms the fast-f32 slot below before its
-        // command handler creates finite verifier authority.
+        // Share one lazy CUDA context and cuBLAS handle across GEMM and resident
+        // CROWN. VNN-COMP prewarms the enabled f32 lane before its deadline.
         use std::sync::{Arc, OnceLock};
         static CUDA_ENGINE: OnceLock<Option<Arc<ny_cuda::CudaGemmEngine>>> = OnceLock::new();
         fn shared_cuda_engine() -> Option<Arc<dyn ny_core::GemmEngine>> {
             CUDA_ENGINE
                 .get_or_init(|| {
-                    // Process-start admission observed a visible device and
-                    // transiently dlopen-able driver/cuBLAS candidate names.
-                    // This constructor selects and retains the actual cudarc
-                    // objects, then validates their live mapped providers on
-                    // Linux. cudarc's dynamic loader instead PANICS on a
-                    // missing symbol in a partial/version-mismatched library
-                    // that did dlopen. The release profile unwinds, so catch_unwind
-                    // converts that Rust panic to the CPU fallback. A native
-                    // abort, fault, or hang still needs process-level GPU
-                    // isolation; the runner's pre-written `unknown` remains
-                    // the fail-closed verdict if this process dies.
+                    // cudarc can panic on missing symbols even after dlopen
+                    // succeeds. Unwinding maps that to CPU fallback; native
+                    // faults or hangs still require process isolation.
                     let constructed = std::panic::catch_unwind(ny_cuda::CudaGemmEngine::new);
                     match constructed {
                         Ok(Ok(engine)) => {
@@ -671,7 +653,7 @@ fn run() -> Result<()> {
                                      initialization failed ({e}); using the fail-closed CPU path"
                                 );
                             } else {
-                                info!("CUDA acceleration unavailable; using CPU f64 path ({e})");
+                                info!("CUDA GEMM/CROWN unavailable; using CPU f64 path ({e})");
                             }
                             None
                         }
@@ -687,7 +669,7 @@ fn run() -> Result<()> {
                                      panicked ({msg}); using the fail-closed CPU path"
                                 );
                             } else {
-                                info!("CUDA engine init panicked; using CPU f64 path ({msg})");
+                                info!("CUDA GEMM/CROWN init panicked; using CPU f64 path ({msg})");
                             }
                             None
                         }
@@ -700,12 +682,8 @@ fn run() -> Result<()> {
         // Scheduling metadata for structural raw loading only; the original
         // root later requires a ready engine with both checked capabilities.
         ny_propagate::beta_crown::certified_root_cut::note_checked_root_cut_factory_registered();
-        // Same shared engine drives the backend ComputeDevice's f32 GEMM seam
-        // (IBP forward / PGD / BaB engine traffic): cuBLAS Sgemm is measured
-        // 2-3.4x faster than the wgpu WGSL shader at every hotspot shape. IEEE
-        // RN-f32 (math mode pinned), so the IBP call sites' order-independent
-        // ULP widening stays valid. NY_NO_CUDA_F32 disables just this seam
-        // (A/B measurement) without losing the sound f64 seam above.
+        // Share f32 GEMM with IBP, PGD, and BaB. Its pinned math mode supports
+        // the bound callers' ULP widening. NY_NO_CUDA_F32 disables only f32.
         if std::env::var_os("NY_NO_CUDA_F32").is_none() {
             ny_propagate::fast_f32_gemm::set_fast_f32_gemm_factory(shared_cuda_engine);
             if prewarm_fast_f32_for_vnncomp {
@@ -723,12 +701,8 @@ fn run() -> Result<()> {
         } else {
             info!("NY_NO_CUDA_F32 set; f32 GEMM engine offload disabled");
         }
-        // Register CUDA separately for the domain-stacked proof forest. Engine
-        // construction remains lazy while the experiment is off; an explicitly
-        // requested wide route prewarms here, before command dispatch can create
-        // verifier deadline authority. Routing remains experimental until an
-        // NVIDIA sealed A/B enables `NY_CUDA_WIDE=1` (or the master
-        // `NY_HYDRA_CROWN=1`). This does not alter ordinary CROWN routing.
+        // The separate wide CROWN factory is opt-in via NY_CUDA_WIDE or
+        // NY_HYDRA_CROWN. Prewarm a requested route before verifier deadlines.
         ny_propagate::sound_gpu_gate::set_wide_sound_gpu_crown_factory(shared_cuda_engine);
         if ny_propagate::sound_gpu_gate::wide_sound_gpu_crown_requested() {
             let ready = ny_propagate::sound_gpu_gate::prewarm_wide_sound_gpu_crown();
@@ -764,23 +738,10 @@ fn run() -> Result<()> {
         }
     }
 
-    // #wgpu-crown-verdict: proof commands use `NY_WGPU_CROWN=auto|0|1` through
-    // their cost/capability planner and exact typed resolver. Non-proof commands
-    // retain the legacy exact `=1` factory below. Its construction consumes the typed
-    // `WgpuVerdictRequest`. That constructor runs and stores the complete
-    // five-rung authority report on the exact device returned to propagation.
-    // Any initialization or qualification error maps to `None`, leaving the
-    // fail-closed CPU verdict path unchanged.
-    //
-    // Ordering: AFTER the CUDA block — the factory is first-install-wins, so
-    // NY_CUDA_CROWN keeps precedence when both are set. The prewarm is
-    // MANDATORY here: under a finite deadline the route only consults the
-    // PREINITIALIZED backend (select_lazy_backend_for_deadline), so a
-    // registered-but-cold factory would be silently invisible in scored runs.
-    // Proof commands construct and retain their one typed device in the shared
-    // command resolver. Do not prewarm this older process-global factory there:
-    // doing so creates a redundant second WGPU context and qualifies evidence
-    // for a device other than the one the command executes on.
+    // Proof handlers resolve NY_WGPU_CROWN=auto|0|1 on their retained device.
+    // Other commands require the literal 1, qualified by WgpuVerdictRequest.
+    // Requested CUDA CROWN registers first and takes precedence. Prewarm here
+    // because finite calls only use initialized engines; proof handlers own theirs.
     if !command_resolves_proof_backend {
         match resolve_wgpu_crown_startup_action(std::env::var_os("NY_WGPU_CROWN").as_deref())? {
             WgpuCrownStartupAction::KeepCpu => {}
@@ -792,12 +753,8 @@ fn run() -> Result<()> {
                             std::sync::Arc::new(device) as std::sync::Arc<dyn ny_core::GemmEngine>
                         })
                 });
-                // The WIDE (domain-stacked batched-BaB) lane rides the same typed
-                // constructor: registration is deliberately independent of the
-                // ordinary lane, and the request gate (`NY_CUDA_WIDE` /
-                // `NY_HYDRA_CROWN` — backend-agnostic despite the names) still
-                // applies, so this stays inert until explicitly asked. Prewarm
-                // matters for the same deadline-preinit reason as above.
+                // Wide CROWN uses the same qualified constructor, independently
+                // gated by NY_CUDA_WIDE/NY_HYDRA_CROWN despite their CUDA names.
                 ny_propagate::sound_gpu_gate::set_wide_sound_gpu_crown_factory(move || {
                     constructor(ny_gpu::WgpuVerdictRequest::new())
                         .ok()
@@ -830,14 +787,8 @@ fn run() -> Result<()> {
         }
     }
 
-    // #margin-row-gpu-eft: register the injected device executor for the
-    // margin-row certified GPU backward lane (NY_MARGIN_ROW_GPU_BACKWARD=1,
-    // default OFF). Registration is UNCONDITIONAL and free: the closure runs
-    // at most once, on the lane's first ARMED admission, and only then builds
-    // the lane's DEDICATED WgpuDevice (deliberately not the process-global
-    // sweep device — the lane's R3 no-shared-fate contract). A dark lane
-    // never constructs anything; a failed construction latches the lane's
-    // channel dead and the unchanged CPU backward runs bit-for-bit.
+    // NY_MARGIN_ROW_GPU_BACKWARD=1 lazily creates a dedicated device. A
+    // construction failure disables that channel and retains CPU backward.
     ny_propagate::margin_row::set_margin_row_lane_gpu_factory(|| {
         ny_gpu::MarginRowLaneDevice::new().ok().map(|device| {
             std::sync::Arc::new(device) as std::sync::Arc<dyn ny_core::MarginRowLaneGpu>
@@ -849,35 +800,22 @@ fn run() -> Result<()> {
     #[cfg(feature = "mip")]
     head_phase_advice::install_lazy_factory();
 
-    // #bbe-joint-root (ENGINE_PROGRAM M5a): register the UNTRUSTED root-search
-    // backend for `margin_row.root_search: joint_f32` (default `ascent`, which
-    // never consults it). Registration is unconditional and free: the closure
-    // runs at most once, on the first armed joint_f32 root or breakpoint-dual
-    // phase. Search outputs are hints: root slopes pass the certify-once gate,
-    // and dual multipliers pass the existing certified node evaluator.
+    // joint_f32 root search proposes hints: slopes pass the certify-once gate,
+    // and dual multipliers pass the certified node evaluator. Ascent is default.
     ny_propagate::margin_row::set_root_search_backend_factory(|| {
         Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
             as std::sync::Arc<dyn ny_core::search::SearchBackend>)
     });
 
-    // #vit-root-alpha (ENGINE_PROGRAM V2): register the UNTRUSTED graph
-    // root-search backend for `margin_alpha_search: joint_f32` (default
-    // `ascent`, which never consults it). Unconditional and free: the closure
-    // runs at most once, on the first ARMED phase. The backend's parameters
-    // reach the certified lane only through its clamp gate and ONE certified
-    // fold, kept only when strictly better.
+    // Graph joint_f32 parameters pass the clamp gate and a certified fold;
+    // keep them only if they improve the incumbent. Ascent remains default.
     ny_propagate::network::graph_root_search::set_graph_root_search_backend_factory(|| {
         Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
             as std::sync::Arc<dyn ny_core::search::SearchBackend>)
     });
 
-    // #wide-fd-search (ENGINE_PROGRAM M4): register the UNTRUSTED level-search
-    // backends of `margin_row.frozen_dual_bab_search` (default `f64`, which
-    // never consults them). Registration is unconditional and free: each
-    // closure runs at most once, on the first ARMED class that asks for it.
-    // The device search builds its own CUDA context lazily, on its first
-    // upload, and refuses fail-soft (the class then runs `f64`); the tier
-    // certifies every prune in f64 whichever backend proposed it.
+    // Frozen-dual search defaults to f64. Optional f32 backends propose hints;
+    // the tier certifies every prune in f64 and retains fallback on refusal.
     ny_propagate::margin_row::set_frozen_dual_search_backend_factory(
         ny_propagate::margin_row::FdBackendKind::CpuF32,
         || {
@@ -885,16 +823,30 @@ fn run() -> Result<()> {
                 as std::sync::Arc<dyn ny_core::search::SearchBackend>)
         },
     );
-    // The device search honours the operator's CUDA kill switch (NY_NO_CUDA,
-    // already read above) but deliberately NOT the cuBLAS-candidate admission
-    // behind `CudaStartupAction::RegisterFactories`: the search kernels need
-    // only libcuda (ENGINE_PROGRAM §1.9), so an image without libcublas must
-    // not lose them. Unregistered, `cuda` runs `f64` and `auto` runs `cpu_f32`.
-    //
-    // ONE device search backend serves both device searches (the level search
-    // here and the wave search below): one own context, one self-test, one
-    // fault latch (a fault in either search poisons the shared context, so
-    // both refuse after it). Construction touches no driver.
+    // Packed root arithmetic owns a separately qualified driver-only context.
+    // Prewarm before VNN-COMP deadlines; a finite call never initializes it.
+    #[cfg(feature = "cuda")]
+    if !cuda_disabled {
+        ny_propagate::margin_row::packed_root_engine::set_factory(|| {
+            match ny_cuda::packed_root::PackedRootEngine::new(0) {
+                Ok(Some(engine)) => Some(std::sync::Arc::new(engine)
+                    as std::sync::Arc<dyn ny_core::packed_root_conv::Engine>),
+                Ok(None) => None,
+                Err(error) => {
+                    warn!(%error, "packed root CUDA qualification unavailable; using CPU contraction");
+                    None
+                }
+            }
+        });
+        if prewarm_fast_f32_for_vnncomp {
+            let ready = ny_propagate::margin_row::packed_root_engine::prewarm();
+            info!(ready, "packed root CUDA startup qualification");
+        }
+    }
+
+    // Level and wave search share one lazy CUDA context and fault latch.
+    // They need libcuda only, so NY_NO_CUDA applies but cuBLAS admission does
+    // not. Without a backend, cuda falls back to f64 and auto to cpu_f32.
     #[cfg(feature = "cuda")]
     let device_search =
         (!cuda_disabled).then(|| std::sync::Arc::new(ny_cuda::search::CudaSearchBackend::new()));
@@ -909,22 +861,13 @@ fn run() -> Result<()> {
         );
     }
 
-    // #wave-beta-bab (ENGINE_PROGRAM M6): register the UNTRUSTED wave search of
-    // `margin_row.tree_mode` (default `legacy`, which never consults it). The
-    // closure runs at most once, on the first ARMED wave tree; the lane
-    // certifies every close with its own evaluator whichever backend searched,
-    // and runs its legacy tree when the backend refuses.
+    // Wave search hints require the lane's certified evaluator. Refusal uses
+    // the legacy tree, which is also the default.
     ny_propagate::margin_row::set_wave_search_backend_factory(|| {
         Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
             as std::sync::Arc<dyn ny_core::search::SearchBackend>)
     });
-    // #wave-beta-bab (M6), DEVICE side: `margin_row.tree_mode: wave_cuda` asks
-    // this factory first — the SAME device backend as the level search above.
-    // Like it, it honours NY_NO_CUDA but not the cuBLAS admission (the wave
-    // kernels need only libcuda); the first wave upload opens the device if
-    // nothing has and loads and self-tests the wave kernels. Unregistered (or
-    // refused), `wave_cuda` runs the CPU search registered above, and only then
-    // the legacy tree.
+    // wave_cuda uses the shared device, then CPU search, then the legacy tree.
     #[cfg(feature = "cuda")]
     if let Some(device) = device_search {
         ny_propagate::margin_row::set_wave_cuda_search_backend_factory(move || {
@@ -933,12 +876,8 @@ fn run() -> Result<()> {
         });
     }
 
-    // #m8-input-split-batch (ENGINE_PROGRAM M8a): register the UNTRUSTED
-    // forward-linear wave search of `bab.branching.input_split.lowdim_batch_engine`
-    // (default `legacy`, which never consults it). The closure runs at most
-    // once, on the first ARMED lowdim lane run; the lane re-bounds every claim
-    // with its own f64 forms and runs its legacy bounder when the backend
-    // refuses.
+    // Low-dimensional batch search re-bounds every hint with its f64 forms;
+    // refusal retains the default legacy bounder.
     ny_propagate::lowdim::set_forward_linear_search_backend_factory(|| {
         Some(std::sync::Arc::new(ny_bbe::CpuF32Backend::new())
             as std::sync::Arc<dyn ny_core::search::SearchBackend>)
@@ -954,13 +893,12 @@ fn run() -> Result<()> {
             info!("NY_NO_CUDA set; CUDA acceleration disabled (CPU f64 path)");
         }
         CudaStartupAction::Unavailable { requested: true } => warn!(
-            "CUDA proof acceleration requested, but startup admission found no process-visible \
-             CUDA device with transiently dlopen-able libcuda/libcublas candidates; CUDA \
-             factories are unavailable and the fail-closed CPU path remains active"
+            "CUDA GEMM/CROWN requested, but startup admission found no device with loadable \
+             libcuda/libcublas candidates; these paths use CPU fallback"
         ),
         CudaStartupAction::Unavailable { requested: false } => info!(
-            "CUDA startup admission found no process-visible device with transiently \
-             dlopen-able libcuda/libcublas candidates; using CPU f64 path"
+            "CUDA GEMM/CROWN admission found no device with loadable libcuda/libcublas \
+             candidates; these paths use CPU fallback"
         ),
         CudaStartupAction::NotCompiled { requested: true } => warn!(
             "CUDA proof acceleration requested, but this binary lacks the `cuda` feature; CUDA \
@@ -969,25 +907,10 @@ fn run() -> Result<()> {
         CudaStartupAction::NotCompiled { requested: false } => {}
     }
 
-    // #accelerate-seam: Apple Accelerate (vecLib BLAS) on Apple silicon.
-    //
-    // DEFAULT OFF. Nothing below runs unless `NY_ACCELERATE_F64=1` (the SOUND
-    // f64 seam that feeds the CROWN backward's `A·W` / `|A|·|W|`) or
-    // `NY_ACCELERATE_F32=1` (the non-verdict IBP/PGD/BaB free-rider) is set;
-    // `NY_NO_ACCELERATE` kills both regardless. Un-armed, this is a single
-    // `getenv` and the process stays byte-identical to today.
-    //
-    // SOUNDNESS. `cblas_dgemm` is IEEE f64, and NY's certified error
-    // `γ_n·S` is summation-order INDEPENDENT — the same Higham argument that
-    // already licenses cuBLAS `Dgemm` above and faer's threaded reduction. The
-    // engine additionally runs a one-shot 20-check conformance probe and refuses
-    // to install on ANY failure, and enforces per call: G1 LP64 shape/stride,
-    // G2 underflow domain (the one regime `γ_n·S` cannot cover), G3 symbol
-    // provenance. Every refusal is a typed `Err`, so each call site keeps its
-    // existing faer/CPU fallback unchanged.
-    //
-    // ORDERING: before the CPU floor below (first installation wins) and after
-    // CUDA, so an actual accelerator still preempts it.
+    // Apple Accelerate is opt-in via NY_ACCELERATE_F64/F32; NY_NO_ACCELERATE
+    // disables both. The engine probes BLAS arithmetic and guards each call;
+    // bound callers still charge rounding error. Register after CUDA and
+    // before the CPU floor because the first factory wins.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         use std::sync::Arc;
@@ -1007,7 +930,7 @@ fn run() -> Result<()> {
                     ny_propagate::fast_f32_gemm::set_fast_f32_gemm_factory(move || {
                         Some(Arc::clone(&for_f32))
                     });
-                    info!("Accelerate f32 free-rider armed (non-verdict IBP/PGD/BaB traffic)");
+                    info!("Accelerate f32 GEMM enabled for IBP, PGD, and BaB");
                 }
             }
             (_, ny_accelerate::InstallOutcome::ProbeRefused(failures)) => {
@@ -1024,37 +947,15 @@ fn run() -> Result<()> {
         }
     }
 
-    // #cpu-gemm-engine: last resort, AFTER every accelerator above has had its
-    // chance to register (first installation wins). Without this, a CPU-only
-    // run left `fast_f32_gemm::is_installed()` false, and each engine-gated
-    // fast path chose its scalar fallback — including the conv Patches
-    // batched-GEMM seam, which is gated on an engine being reachable AT ALL and
-    // was therefore structurally unreachable on any host without a GPU.
-    // `NY_CPU_GEMM_ENGINE=0` restores the previous behaviour.
+    // Fill unclaimed GEMM factories with CPU engines, including the Patches
+    // batched path. NY_CPU_GEMM_ENGINE=0 disables the f32 registration.
     ny_propagate::faer_parallelism::install_cpu_gemm_engine_if_absent();
 
-    // #cpu-sound-f64-engine: same last-resort discipline for the SOUND f64 seam,
-    // which until now only a CUDA build ever populated. On a CPU-only host
-    // `sound_f64_gemm` stayed empty, so `aw_f64_with_abssum_unbounded` fell
-    // through to a path that computes the abs-sum `S` with a SECOND FULL f64
-    // GEMM; with any engine present it instead builds `S` from the cheap f32
-    // seam. Measured worth of exactly this change: +2.4% end-to-end
-    // (`FAER/OFF = 1.024x`, tests/audit_attribution.rs), with published bounds
-    // bit-identical to the engine-absent arm. Note the vendor-BLAS variant
-    // measured NEGATIVE on top of this (`ACC/FAER = 0.955x`) — the gain belongs
-    // to having an engine at all, not to the kernel.
-    // `NY_CPU_SOUND_F64_ENGINE=0` restores the previous behaviour.
+    // NY_CPU_SOUND_F64_ENGINE=0 disables the corresponding f64 registration.
     ny_propagate::faer_parallelism::install_cpu_sound_f64_gemm_engine_if_absent();
 
-    // #fl-value-gpu-tier ORDERING FIX (2026-08-02): the factory was registered
-    // inside `handle_beta_crown_command`, but the plan resolver's rate probe
-    // (`resolve_and_materialize`, vnncomp.rs) runs BEFORE that handler — so the
-    // probe measured the CPU-only chain, OnceLock-cached that rate, and the FL
-    // admission gate never saw GPU speed even when the build later used it.
-    // Register at startup, exactly like the CPU floor above: lazy (nothing
-    // constructed until the seam's first consult) and fallible (None on hosts
-    // without a usable adapter). The beta-crown registration remains as a
-    // benign second `set` (first-install-wins).
+    // Non-proof commands register FL-value acceleration before rate probes.
+    // Proof handlers register after resolving ownership of their WGPU device.
     if !command_resolves_proof_backend && !compute_backend::detect().wgpu_probe_skipped {
         ny_propagate::fl_value_gemm::set_fl_value_gemm_factory(|| {
             match ny_gpu::FlValueGemmDevice::new_wgpu() {

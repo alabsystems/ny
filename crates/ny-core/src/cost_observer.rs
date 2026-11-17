@@ -2,21 +2,19 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! #cost-observer — invariant I1's missing PRODUCER.
+//! #cost-observer — measured per-call costs for invariant I1.
 //!
 //! [`crate::phase_window`] states the rule this module exists to make
 //! satisfiable: *"`predicted` is the phase's own cost estimate **on this host**
 //! — from a measured rate, not a constant."* It takes `predicted: Duration` as
-//! an argument and never says where it comes from. Today exactly two producers
-//! exist, and both need an **analytic** cost model to work:
+//! an argument. Analytic cost producers include:
 //!
 //! * `#forward-linear-cost-gate` multiplies a MAC count by a probed `GMAC/s`;
 //! * `WalkCostModel` does the same for `graph_alpha` walks.
 //!
-//! A repeated seam with no MAC model has no producer at all, so it reads a
-//! hand-set constant instead. This module is the producer for that case: it
-//! measures the seam's **own** per-call cost as the run proceeds and derives the
-//! budget from the measurement plus the live remaining wall.
+//! This module handles repeated seams without a MAC model. It measures the
+//! seam's **own** per-call cost as the run proceeds and derives the budget from
+//! those observations plus the live remaining wall.
 //!
 //! ## Why a constant cannot work here — the measurement that motivated this
 //!

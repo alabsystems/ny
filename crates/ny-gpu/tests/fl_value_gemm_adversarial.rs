@@ -4,41 +4,21 @@
 
 #![recursion_limit = "256"]
 
-//! Adversarial-verify tests for #fl-value-gpu-tier (`FlValueGemmDevice`):
-//! the binding-budget boundary (refusal just past it, a correct product at
-//! it), budget-driven row chunking, chunk-partition exactness, and the typed
-//! refusals for un-chunkable configurations.
+//! Adversarial controls for `FlValueGemmDevice`: live binding-budget edges,
+//! row chunking, chunk-partition exactness, dispatch limits and typed refusals.
+//! Boundaries come from [`FlValueGemmDevice::chunk_budget_elems`].
 //!
-//! # Provenance
-//!
-//! Written by the tier's adversarial verify and recovered uncommitted. As
-//! written, the boundary tests mirrored the pre-#hard-caps budget by hand
-//! (half of wgpu's DEFAULT 128 MiB binding). `16034c8fc` moved the tier to
-//! half of the device's LIVE binding capacity, so on a big-binding adapter
-//! the old "just over budget" shape was no longer over anything and the
-//! refusal test failed. They now derive every boundary from
-//! [`FlValueGemmDevice::chunk_budget_elems`], the budget the handle really
-//! applies.
-//!
-//! Re-deriving the boundary exposed a real defect: the tier admitted `B`
-//! up to half the live capacity, but `WgpuDevice::gemm_f32` still refused
-//! any `B` past the static 128 MiB wall, so on an M5 Max (4 GiB - 4 B granted)
-//! every admitted shape between 112 MB and 1.79 GB came back as
-//! `GpuMemoryExceeded { budget_bytes: 134217728 }`.
+//! Regression controls cover buffers admitted by the live budget that exceed
+//! the former static 128 MiB cap:
 //! [`b_past_static_wall_within_live_budget_computes`] and
-//! [`b_at_live_budget_edge_computes`] pin the fix.
-//!
-//! Moving the device's row split to the live limit then removed the bound
-//! that had kept every batch inside the tiled shader's dispatch grid for
-//! k > 64; [`rows_past_tiled_dispatch_limit_compute_exactly`] pins the
-//! per-shader cap that restores it.
+//! [`b_at_live_budget_edge_computes`].
+//! [`rows_past_tiled_dispatch_limit_compute_exactly`] covers the tiled
+//! shader's dispatch-grid cap for k > 64.
 //!
 //! # Gating
 //!
-//! `required-features = ["wgpu", "gpu-tests"]`: the default build never
-//! compiles this file. Under `gpu-tests` an unavailable adapter is a hard
-//! failure, per `TEST_CONFORMANCE.md` "GPU conformance": a green run must
-//! mean the kernels ran.
+//! Requires `wgpu,gpu-tests`; workspace tests enable these through `ny-cli`.
+//! An unavailable adapter fails, as specified in `TEST_CONFORMANCE.md`.
 //!
 //! The consuming forward-linear f32 seam is disarmed (default off since
 //! `2cd8b525f`; no shipped preset sets `forward_linear_f32_seam`), but the

@@ -470,13 +470,7 @@ fn cli_top_level_about_matches_repo_scope() {
     );
 }
 
-/// `ny --version` must report the DERIVED build version, not the frozen
-/// `Cargo.toml` one (#binary-identity).
-///
-/// Tracking `CARGO_PKG_VERSION` made every binary of this campaign answer
-/// `ny 0.3.0`: `[workspace.package] version` did not move while the verifier
-/// changed underneath it, so on 2026-08-21 a manifest sealed against one binary
-/// and 330 rows measured by another could not be told apart by their versions.
+/// `ny --version` uses the build-derived patch and the manifest's major/minor.
 #[test]
 fn cli_version_is_the_derived_build_version_not_the_frozen_cargo_patch() {
     let cmd = Cli::command();

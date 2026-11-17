@@ -54,6 +54,11 @@ export PATH="$PWD/target/release:$PATH"
 measurements, enable `--features mip`; add `cuda` for the CUDA lane. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for build profiles and Linux requirements.
 
+In Git checkouts, `ny --version` uses the manifest's major/minor and the commit
+count as its patch, with a suffix for tracked build-relevant edits. Counts can
+coincide across branches; `ny --build-id` reports the commit, build stamp, and
+executable SHA-256 for reproducible measurements.
+
 `tests/models/crossing_relu.nnet` computes `f(x) = |x|`. Prove that its output
 never reaches 2 for any input in `[-1, 1]`:
 
@@ -67,8 +72,8 @@ Status: VERIFIED
 All inputs produce output < 2
 ```
 
-Now ask whether the output can reach 0.5. It can, so `ny` returns a
-counterexample, having first re-run it through the model:
+Now ask whether the output can reach 0.5. `ny` returns a counterexample it has
+re-run through the model (the input may vary):
 
 ```bash
 ny beta-crown tests/models/crossing_relu.nnet -p tests/models/crossing_relu_unsafe.vnnlib
@@ -94,7 +99,7 @@ Counterexample input: [0.50806665]
 For CI, `ny verify --allow-unknown` maps ordinary `unknown` results to 0.
 A refused counterexample still exits 2; timeouts and errors keep their codes.
 
-New to verification? `ny tutorial` is an interactive introduction, and
+New to verification? `ny tutorial` offers short lessons, and
 `ny tutorial demo` runs the example above.
 
 ## Checking the answers
@@ -102,9 +107,8 @@ New to verification? `ny tutorial` is an interactive introduction, and
 **Counterexamples** are re-executed through the model before `ny` reports them.
 
 **Certificates** are optional for sequential, fully connected ReLU networks
-with up to 8192 hidden neurons. `ny` attempts an exact-rational CROWN proof of
-a supported safety margin, then self-checks its entailment and Farkas
-certificates before writing them:
+with up to 8192 hidden neurons. `ny` attempts an exact-rational CROWN proof
+and self-checks its entailment and Farkas certificates before writing them:
 
 ```bash
 ny beta-crown tests/models/crossing_relu.nnet \
@@ -120,12 +124,11 @@ proofs of the certificate lemmas live in
 states what is proved and what is assumed.
 
 By default `beta-crown` attempts `<model-stem>.cert.json` next to the model.
-Emission is best effort: unsupported properties, inconclusive exact CROWN
-derivation, exhausted budgets, or write failures can leave a verified verdict
-without a sidecar. Pass `--no-certificate` to disable optional emission;
-`--require-certificate` takes precedence and restricts verdicts to proofs the
-external format can represent. Skipping optional emission leaves the verdict
-unchanged.
+Emission is best effort: unsupported properties, inconclusive derivation,
+budget limits, or write failures can leave a verified verdict without a
+sidecar. `--no-certificate` disables optional emission without changing the
+verdict; `--require-certificate` takes precedence and restricts verdicts to
+proofs the external format can represent.
 `ny vnncomp` runs under the `competition` proof profile, which skips the
 certificate and samples downgrade-only audits less often; the certifiers that
 decide a verdict run identically in both profiles.
@@ -152,9 +155,9 @@ decide a verdict run identically in both profiles.
 | `ny weights info --file MODEL` | Inspect stored weights. |
 | `ny gt verify …` | Check geometric ground-truth properties. |
 | `ny export --size SIZE --output FILE` | Generate a Python script that exports a Whisper encoder to ONNX. |
-| `ny tutorial` | Interactive introduction to verification. |
+| `ny tutorial` | Short verification lessons and a runnable demo. |
 
-`ny --help` and `ny <command> --help` list every flag.
+`ny --help` and `ny <command> --help` describe commands and public options.
 
 `ny coverage` classifies trace operators as `exact`, `sound`,
 `sound_but_loose`, or `unsupported`. These describe possible relaxations;
@@ -170,10 +173,10 @@ the harness scripts. `ny benchmarks` works on whole corpora:
 ny benchmarks download 2025 2026                    # fetch corpora (large)
 ny benchmarks status --year 2026 --strict           # check that assets are present
 ny benchmarks run --year 2026 --category CATEGORY \
-  --output reports/sweeps/run.csv                   # add --resume to continue
+  --vnnlib-version 2.0 --output reports/sweeps/run.csv # add --resume to continue
 ny benchmarks score --results BANK_DIR --official RESULTS_CHECKOUT --year 2026 \
   --budget-year 2026 --ny-ce-checks REPLAY_CHECKS --ny-ce-source SOURCE_COMMIT
-ny benchmarks reseed --year 2026 --category CATEGORY --limit 10
+ny benchmarks reseed --year 2026 --category CATEGORY --vnnlib-version 2.0 --limit 10
 ```
 
 - **`run`** runs each instance in its own process at the official
@@ -190,22 +193,36 @@ ny benchmarks reseed --year 2026 --category CATEGORY --limit 10
   official score. For 2026, adjudicated mode uses published per-run checks;
   strict SAT witnesses can penalize UNSAT, while tolerant acceptance credits
   only its own SAT. NY SAT rows need source-bound `--ny-ce-checks`; missing
-  checks remain unqualified and receive zero. The
-  [replay exporter](scripts/export_cct_replay_checks.py) currently supports CCT
-  pilot records; run it with `--help` for the required inputs.
+  checks remain unqualified and receive zero. The NY replay reader and
+  [exporter](scripts/export_cct_replay_checks.py) currently accept CCT pilot
+  receipts only; see the exporter's `--help` for inputs.
+  With `--year 2026 --budget-year 2026`, field timeout checks subtract each
+  tool's fastest decided solve from its runtimes, using the complete
+  `TOOL/results.csv` including harness rows, as in the
+  [published processor](https://github.com/VNN-COMP/vnncomp2026_results/blob/eea564f5d0a8751d8321a409214db14d03f452b8/SCORING/process_results.py).
+  NY keeps its strict original wall-budget check. Rule modeling does not
+  establish corpus identity or cross-version equivalence. The CSV reader rejects
+  published `-1` preparation-failure runtimes, so the complete official 2026
+  checkout still fails before scoring.
 - **`reseed`** re-runs instances under renamed copies of their files and
   checks that the verdicts match.
 
 `scripts/canonicalize_vnncomp_ce_y.py` recomputes a counterexample's output
-values under a pinned ONNX Runtime, keeping its inputs byte for byte, and
+values under a pinned ONNX Runtime, preserving every input numeric token, and
 refuses the result if the witness no longer violates the property at zero
 tolerance.
 
-`ny` has not been an official VNN-COMP entrant. It is measured locally on past
-VNN-COMP benchmarks at the official time limits. The result bank, its
-provenance rules, and the scripts that re-run and score it are described in
-[`reports/measured/`](reports/measured/README.md). These are local
-measurements, not official or independently attested results.
+`ny` has not been an official VNN-COMP entrant. The
+[2025 result bank](reports/measured/README.md) documents local measurements at
+the official time limits, replay, and scoring. These results are not official
+or independently attested.
+
+The November 17 head-confirmation cache update
+passed 35 selected tests and a CUDA CLI check. Its matched
+Tiny177 pilot
+produced four accepted timeouts. The candidate's diagnostic run completed 86 of
+199 confirmation rows; head composition remained unfinished. No extra solve or
+statistical end-to-end speedup is established.
 
 ## Methods
 
@@ -231,8 +248,8 @@ limited to at most four bounded scalar inputs, and everything else is
 
 **Transformers.** `ny` loads and inspects Whisper and decoder models and
 extracts their components, but it does not yet verify them: those requests
-fail closed instead of returning unproven bounds. `ny export` writes a Python
-script that exports a Whisper encoder to ONNX:
+fail closed instead of returning unproven bounds. To export a Whisper encoder
+to ONNX:
 
 ```bash
 python -m pip install torch openai-whisper onnx onnxscript
@@ -247,9 +264,10 @@ Keep the `.data` weight file the script writes next to the `.onnx` file.
 - `--features mip` adds the LP/MIP lane (`ny-mip`, running `ay-milp`
   in-process).
 - `--features cuda` adds a dynamically loaded CUDA/cuBLAS accelerator.
-- `--max-queue-bytes N` (preset key `bab.max_queue_bytes`) caps the memory of
-  the branch-and-bound queue. If the cap forces an unexplored domain to be
-  dropped, the answer is `unknown`, never `verified`.
+- `--max-queue-bytes N` (preset key `bab.max_queue_bytes`) budgets estimated
+  graph branch-and-bound queue payload, not total process memory. Zero disables
+  it; the highest-priority domain is retained even if it exceeds the budget.
+  Evicting an unexplored domain prevents a `verified` result.
 
 ## GPU
 
@@ -259,15 +277,21 @@ The default build includes a wgpu backend (Metal, Vulkan, DX12):
 ny beta-crown model.onnx -p prop.vnnlib --backend wgpu
 ```
 
-A GPU contributes to a proof only after it passes qualification checks on
-that adapter, covering IEEE f32 semantics, error-free transformations, and
-subnormal handling. If any check fails, `ny` falls back to the CPU, prints
-`NY-HARNESS: BACKEND-OVERRIDE`, and records why. There is no switch to skip
-qualification.
+For proof work, wgpu first qualifies the adapter's f32 arithmetic, error-free
+transformations, and subnormal preservation. If that path fails, it tries a
+qualified path that bounds subnormal-flush error. If neither qualifies, `ny`
+uses the CPU, prints `NY-HARNESS: BACKEND-OVERRIDE`, and records why. There is
+no switch to skip qualification.
 
-Counterexample search is exempt. GPU arithmetic there only steers where to
-look, and every candidate still passes the same CPU checks, so the search uses
-whatever accelerator the host has.
+Counterexample search can use GPU arithmetic without proof qualification to
+propose inputs. Backend requests and availability still apply, and every
+candidate passes the same CPU checks.
+
+With `--features cuda`, admitted compact or near-dense root convolutions can use
+an independently qualified CUDA engine. The competition entry point prewarms it
+before instance deadlines; finite-deadline calls use only an existing engine.
+Unsupported devices keep CPU contraction. `NY_NO_CUDA=1` disables this path.
+See the [arithmetic and failure contract](crates/ny-cuda/kernels/packed_root_README.txt).
 
 ## Python
 
@@ -295,10 +319,11 @@ maturin develop --release
 ```
 
 The `ny` module provides `verify()` and `verify_torch()` (IBP, CROWN, α- and
-β-CROWN on ONNX files or in-memory `torch.nn.Module`s), model diffing and
-equivalence checks, quantization checks, bound profiling, and a pytest plugin,
-`ny_pytest`, with `assert_verified`, `assert_equivalent`, and `assert_bounds`.
-It ships type stubs.
+β-CROWN on ONNX files or in-memory `torch.nn.Module`s). Pass
+`output_bounds=[(lower, upper), ...]` to state a property; omitting it computes
+bounds without checking a property. It also provides model diffing,
+equivalence and quantization checks, bound profiling, type stubs, and the
+`ny_pytest` plugin with `assert_verified`, `assert_equivalent`, and `assert_bounds`.
 
 ## Testing
 
@@ -307,10 +332,13 @@ targo --unverified check --workspace --exclude ny-python
 targo --unverified test --locked --workspace --exclude ny-python
 ```
 
-The suite is hermetic and must not contain ignored or skipped tests; a
-source-policy test rejects them. GPU, Python-binding, real-benchmark, and
-external-checker tests are separate opt-in lanes that fail fast when their
-prerequisites are missing.
+The default suite needs no benchmark downloads. Two legacy ACAS controls
+return early when the optional 2023 corpus is absent, providing no coverage.
+Explicit ignore and skip directives are rejected by a source-policy test.
+The workspace test command includes real GPU controls: `ny-cli` enables
+`ny-gpu/gpu-tests` through a dev dependency, so it needs a suitable adapter.
+Python-binding, benchmark-corpus and external-checker lanes have separate
+prerequisites; see `TEST_CONFORMANCE.md`.
 
 Beyond unit and property tests:
 

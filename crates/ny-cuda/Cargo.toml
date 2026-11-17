@@ -2,10 +2,9 @@
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 #
-# Native CUDA / cuBLAS GEMM engine for ny. Isolated in its own crate because it
-# contains the only `unsafe` FFI surface in the GPU stack (cuBLAS calls);
-# ny-core / ny-gpu keep `#![forbid(unsafe_code)]`. cudarc dynamic-loads CUDA at
-# runtime (no build-script linking), so this builds under the Trust toolchain.
+# CUDA backends and cuBLAS GEMM, including driver-only packed-root arithmetic.
+# This crate isolates unsafe GPU FFI; ny-core / ny-gpu forbid unsafe code.
+# cudarc loads CUDA libraries dynamically, without build-script linking.
 [package]
 name = "ny-cuda"
 description = "Native CUDA / cuBLAS GEMM engine for ny (coherent and discrete NVIDIA GPUs)"
@@ -15,6 +14,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
+
+[features]
+# Explicit packed-root device conformance; missing hardware fails the lane.
+gpu-tests = []
+# Hardware throughput measurements use the same mandatory device contract.
+benchmarks = ["gpu-tests"]
 
 [lints]
 workspace = true
@@ -26,11 +31,8 @@ ny-core = { path = "../ny-core" }
 # symbols across toolkit minors and additionally binds a complete pair of
 # known cuBLASLt delegation exports when that implementation exposes them.
 # cudarc < 0.19 rejects CUDA 13 at build time.
-# `nvrtc` is COMPILE-TIME ONLY here: it provides `Ptx` / `CudaContext::load_module`,
-# which the untrusted level search (`search`, ENGINE_PROGRAM §1.9) uses to load
-# its committed fatbin (`cuModuleLoadData`). Nothing is compiled at runtime, so
-# libnvrtc is never dlopen'd and hosts without a CUDA toolkit are unaffected;
-# the feature adds no dependency (Cargo.lock is unchanged).
+# `nvrtc` provides Ptx / CudaContext::load_module for committed search fatbins
+# and packed-root cubins. No runtime compilation or libnvrtc loading is used.
 cudarc = { version = "0.19", default-features = false, features = ["cublas", "driver", "dynamic-loading", "cuda-13000", "nvrtc"] }
 libc = "0.2"
 sha2.workspace = true
