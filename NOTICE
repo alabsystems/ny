@@ -1,8 +1,8 @@
 ny
 Copyright 2026 Andrew Yates
 
-ny is licensed under the ALab Academic Use License 1.0; the terms are in LICENSE.
+ny is licensed under the PolyForm Noncommercial License 1.0.0; the terms are in LICENSE.
 
 ny's binaries include third-party components. Each remains under its own
-license, and nothing in the ALab Academic Use License limits the rights that license
-gives you.
+license: the PolyForm Noncommercial License 1.0.0 covers only ALab's own work
+and limits none of the rights those licenses give you.
